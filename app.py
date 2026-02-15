@@ -4,9 +4,10 @@ import requests
 from requests.auth import HTTPBasicAuth
 from datetime import datetime
 
-# --- 1. SETTINGS ---
-API_USER = "DIHpCLFafv4Lr6XHNFfUDhzk"
-API_PASS = "JIoYBHF8cbJjnjiBkV5XzuUg"
+# --- 1. SETTINGS (CLOUD VERSION) ---
+# This tells the app to pull the keys from the Streamlit 'Advanced Settings'
+API_USER = st.secrets["API_USER"]
+API_PASS = st.secrets["API_PASS"]
 
 st.set_page_config(page_title="Value Finder Pro", layout="wide")
 st.title("🏇 Value Finder Pro")
