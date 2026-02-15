@@ -54,23 +54,27 @@ if st.button('🚀 Run Analysis'):
     if not races:
         st.warning("No data found. Check your API connection.")
     else:
-        total_value_bets = 0
-        all_export_data = []  # List to hold horses for the CSV
+        # 1. TIMESTAMP & INITIALIZATION
+        current_time = datetime.now().strftime("%H:%M:%S")
+        st.info(f"Last updated at: {current_time}")
         
-        # 1. SCAN DATA
+        total_value_bets = 0
+        all_export_data = [] # List to hold horses for the CSV
+        
+        # 2. SCAN DATA
         for race in races:
-            for r in race.get('runners', []):
+            runners = race.get('runners', [])
+            for r in runners:
                 score = get_score(r)
                 odds = r.get('odds', 'N/A')
                 dec = odds_to_dec(odds)
                 is_v = score >= 20 and dec >= 5.0
                 
-                # Only add to CSV if they meet your sidebar 'Minimum Score'
+                # Filter logic for display and CSV
                 if score >= min_score:
                     if only_show_value and not is_v:
                         continue
                     
-                    # Prepare the row for CSV
                     all_export_data.append({
                         "Time": race.get('off_time'),
                         "Course": race.get('course'),
@@ -81,33 +85,33 @@ if st.button('🚀 Run Analysis'):
                     })
                     if is_v: total_value_bets += 1
 
-        # 2. DASHBOARD METRICS
+        # 3. DASHBOARD METRICS
         has_odds = any(r.get('odds') for race in races for r in race.get('runners', []))
         c1, c2, c3 = st.columns(3)
         c1.metric("Meetings", len(races))
         c2.metric("Value Bets", total_value_bets)
         c3.metric("API Status", "✅ LIVE" if has_odds else "⚠️ NO ODDS")
 
-        # 3. DOWNLOAD BUTTON
+        if not has_odds:
+            st.error("The API is currently not sending odds data to your account.")
+
+        # 4. DOWNLOAD BUTTON
         if all_export_data:
             df_export = pd.DataFrame(all_export_data)
             csv = df_export.to_csv(index=False).encode('utf-8')
             
-            # Create a timestamped filename
-            now = datetime.now().strftime("%Y-%m-%d_%H%M")
-            file_name_with_date = f"selections_{now}.csv"
-            
+            now_file = datetime.now().strftime("%Y-%m-%d_%H%M")
             st.download_button(
                 label="📥 Download Selections to CSV",
                 data=csv,
-                file_name=file_name_with_date,
+                file_name=f"selections_{now_file}.csv",
                 mime='text/csv',
             )
             st.divider()
 
-        # 4. DISPLAY TABLES
+        # 5. DISPLAY TABLES
         for race in races:
-            runners = race.get('runners', [])
+            # Filter the export data for just this specific race
             meeting_rows = [row for row in all_export_data if row['Course'] == race.get('course') and row['Time'] == race.get('off_time')]
             
             if meeting_rows:
