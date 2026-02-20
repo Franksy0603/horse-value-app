@@ -15,7 +15,7 @@ st.title("🏇 Value Finder Pro: Standard Edition")
 if 'history' not in st.session_state:
     st.session_state.history = []
 
-# --- 2. CORE MATH FUNCTIONS ---
+# --- 2. CORE MATH & DEEP SCAN FUNCTIONS ---
 def odds_to_dec(o):
     try:
         if not o or '/' not in str(o): return 0.0
@@ -24,32 +24,49 @@ def odds_to_dec(o):
     except: return 0.0
 
 def get_best_odds(runner):
-    """Picks the highest available decimal odds from the bookmaker list"""
+    """Deep scans the bookmaker dictionary to find any available price"""
+    # 1. Look for the dictionary of bookies
     bookies = runner.get('bookmaker_odds', {})
-    if not bookies: return 0.0
+    
+    # 2. If it's empty, check for common fallback fields
+    if not bookies or not isinstance(bookies, dict):
+        fallback = runner.get('odds') or runner.get('best_odds') or runner.get('sp_odds')
+        if fallback and isinstance(fallback, str):
+            return odds_to_dec(fallback)
+        return 0.0
     
     decimal_prices = []
-    for price in bookies.values():
-        dec = odds_to_dec(price)
-        if dec > 0: decimal_prices.append(dec)
-    
+    # 3. Loop through every bookmaker entry provided
+    for val in bookies.values():
+        if isinstance(val, str) and '/' in val:
+            dec = odds_to_dec(val)
+            if dec > 1.0: decimal_prices.append(dec)
+        elif isinstance(val, (int, float)):
+            if float(val) > 1.0: decimal_prices.append(float(val))
+            
+    # 4. Return the highest price found
     return max(decimal_prices) if decimal_prices else 0.0
 
 def get_score(h, race_going):
-    """Standard Tier Scoring: Uses 'form' and 'trainer_stats'"""
+    """Standard Tier Scoring: Updated for flexible data reading"""
     s = 0
-    # Last Run Logic (Check if last race in form string was a '1')
-    form = str(h.get('form', ''))
+    # 1. Form check (Checks 'form' string or 'last_run_result')
+    form = str(h.get('form', h.get('last_run_result', '')))
     if form and form[-1] == '1': s += 15
     
-    # Trainer Stats logic
+    # 2. Trainer check (handles stats dict or flat field)
     t_stats = h.get('trainer_stats', {})
-    t_win = t_stats.get('win_percentage', 0)
+    t_win = 0
+    if isinstance(t_stats, dict):
+        t_win = t_stats.get('win_percentage', 0)
+    else:
+        t_win = h.get('trainer_win_percentage', 0)
+        
     if t_win > 25: s += 20
     elif t_win > 15: s += 10
     
-    # Ground Preference
-    horse_best = str(h.get('best_going', '')).lower()
+    # 3. Ground check
+    horse_best = str(h.get('best_going', h.get('going_preference', ''))).lower()
     if race_going and str(race_going).lower() in horse_best:
         s += 10 
     return s
@@ -63,7 +80,6 @@ def highlight_value(row):
 # --- 3. DATA FETCH ---
 @st.cache_data(ttl=60)
 def get_data():
-    # Standard Tier Endpoint
     url = "https://api.theracingapi.com/v1/racecards/standard"
     try:
         r = requests.get(url, auth=HTTPBasicAuth(API_USER.strip(), API_PASS.strip()), timeout=15)
@@ -74,7 +90,7 @@ def get_data():
 
 # --- 4. SIDEBAR TRACKER ---
 st.sidebar.header("⚙️ Strategy Filters")
-min_score = st.sidebar.slider("Minimum Horse Score", 0, 50, 0) # Set to 0 to see all data during testing
+min_score = st.sidebar.slider("Minimum Horse Score", 0, 50, 0)
 only_show_value = st.sidebar.checkbox("Only show 'Value' bets", value=False)
 
 st.sidebar.divider()
@@ -94,7 +110,7 @@ if st.button('🚀 Run Analysis'):
     races = get_data()
     
     if not races:
-        st.warning("No data found. Ensure your Standard Tier upgrade is active.")
+        st.warning("No data found. Check your API credentials and Tier.")
     else:
         current_time = datetime.now().strftime("%H:%M:%S")
         st.info(f"Last updated at: {current_time}")
@@ -113,8 +129,8 @@ if st.button('🚀 Run Analysis'):
                 # Value Logic: Score 20+ and Odds 5.0 (4/1) or better
                 is_v = score >= 20 and best_dec >= 5.0
                 
-                # Format odds for display (e.g., "5.0" back to "4/1")
-                display_odds = f"{int(best_dec-1)}/1" if best_dec > 0 else "N/A"
+                # Display Odds Formatting
+                display_odds = f"{int(best_dec-1)}/1" if best_dec > 1.0 else "N/A"
                 
                 if score >= min_score:
                     if only_show_value and not is_v: continue
@@ -133,13 +149,14 @@ if st.button('🚀 Run Analysis'):
         c1, c2, c3 = st.columns(3)
         c1.metric("Meetings", len(races))
         c2.metric("Value Bets", total_v)
-        c3.metric("Mode", "Standard Data ✅")
+        c3.metric("API Tier", "Standard ✅")
 
         # Meeting Expanders
         for race in races:
             m_rows = [row for row in all_export_data if row['Course'] == race.get('course') and row['Time'] == race.get('off_time')]
             if m_rows:
-                with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')} ({race.get('going', 'Unknown')})"):
+                going_label = race.get('going', 'Unknown')
+                with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')} ({going_label})"):
                     df_display = pd.DataFrame(m_rows)[["Horse", "Score", "Odds", "Value"]]
                     st.dataframe(df_display.style.apply(highlight_value, axis=1), use_container_width=True, hide_index=True)
                     
