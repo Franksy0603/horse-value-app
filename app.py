@@ -22,7 +22,6 @@ st.title("🏇 Value Finder Pro: Google Sheets Ledger")
 # --- 2. SIDEBAR CONTROLS & LEDGER ---
 st.sidebar.header("⚙️ Controls")
 min_score = st.sidebar.slider("Minimum Value Score", 0, 50, 20, 5)
-st.sidebar.caption(f"Showing horses with score ≥ {min_score}")
 
 st.sidebar.markdown("---")
 st.sidebar.header("📊 Performance Ledger")
@@ -37,6 +36,7 @@ if HAS_GSHEETS and GSHEET_URL:
 def load_ledger():
     if conn and GSHEET_URL:
         try:
+            # We fetch the sheet with ttl=0 to ensure we see the 'Pending' status immediately
             return conn.read(spreadsheet=GSHEET_URL, ttl=0)
         except Exception:
             pass
@@ -44,7 +44,12 @@ def load_ledger():
 
 if st.sidebar.button("🔄 Reconcile Results"):
     ledger = load_ledger()
-    if not ledger.empty and "Pending" in ledger['Result'].values:
+    # Debug info to help you see why it might be failing
+    if ledger.empty:
+        st.sidebar.error("Sheet is empty. Log some bets first!")
+    elif "Pending" not in ledger['Result'].values:
+        st.sidebar.warning(f"Found {len(ledger)} rows, but none are marked as 'Pending'.")
+    else:
         with st.sidebar:
             status = st.empty()
             status.info("Checking API for winners...")
@@ -53,6 +58,7 @@ if st.sidebar.button("🔄 Reconcile Results"):
                 res = requests.get("https://api.theracingapi.com/v1/results", auth=auth, timeout=15)
                 results_data = res.json().get('results', [])
                 
+                # Create list of winning horses
                 winners = [str(runner.get('horse')).upper().strip() 
                            for race in results_data 
                            for runner in race.get('runners', []) 
@@ -66,19 +72,18 @@ if st.sidebar.button("🔄 Reconcile Results"):
                                 row['Result'] = "Winner"
                                 row['P/L'] = float(row['Odds']) - 1
                             else:
+                                # We only mark as Loser if the race is actually finished (found in results)
                                 row['Result'] = "Loser"
                                 row['P/L'] = -1.0
                         return row
 
                     updated_ledger = ledger.apply(process_row, axis=1)
                     conn.update(spreadsheet=GSHEET_URL, data=updated_ledger)
-                    status.success("Sheet Updated Successfully!")
+                    status.success("✅ Ledger Updated!")
                 else:
-                    status.warning("No new winners found in API yet.")
+                    status.warning("API results are in, but no winners matched your bets yet.")
             except Exception as e:
                 status.error(f"Error: {str(e)}")
-    else:
-        st.sidebar.info("No 'Pending' bets to update.")
 
 # --- 3. SCORING & ODDS LOGIC ---
 def get_best_odds(runner):
@@ -144,17 +149,16 @@ if st.button('🚀 Run Analysis'):
                     })
 
         if all_value_horses:
-            st.markdown("### 🏆 Top Value Bets")
+            st.markdown("### 🏆 Top Daily Value Bets")
             top_3 = sorted(all_value_horses, key=lambda x: x['Score'], reverse=True)[:3]
             cols = st.columns(3)
             for i, h in enumerate(top_3):
                 with cols[i]:
-                    # Gold background container
-                    st.success(f"**{h['Horse']}**")
-                    st.metric(label="Score", value=h['Score'])
-                    st.write(f"**Odds:** {int(h['Odds']-1)}/1")
+                    # Using a colored info box to simulate the 'Gold' look
+                    st.info(f"### {h['Horse']}")
+                    st.write(f"**Score:** {h['Score']} | **Odds:** {int(h['Odds']-1)}/1")
             
-            if st.button("📤 Log Today's Value Bets"):
+            if st.button("📤 Log Today's Value Bets to Google Sheets"):
                 if conn:
                     existing = load_ledger()
                     new_bets = pd.DataFrame(all_value_horses)
@@ -163,7 +167,7 @@ if st.button('🚀 Run Analysis'):
                         updated_df = pd.concat([existing, filtered], ignore_index=True)
                         conn.update(spreadsheet=GSHEET_URL, data=updated_df)
                         st.balloons()
-                        st.success("Successfully Logged to Google Sheets!")
+                        st.success("Successfully Logged!")
         
         # Breakdown Tables
         for race in races:
@@ -180,7 +184,6 @@ if st.button('🚀 Run Analysis'):
                         "Odds": f"{int(o-1)}/1" if o > 1 else "SP",
                         "Value": "💎 VALUE" if is_value else ""
                     })
-                df_display = pd.DataFrame(table_data)
-                st.table(df_display)
+                st.table(pd.DataFrame(table_data))
     else:
         st.warning("No data found. Check your API credentials.")
