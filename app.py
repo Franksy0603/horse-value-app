@@ -13,15 +13,13 @@ GSHEET_URL = st.secrets.get("gsheet_url", "")
 st.set_page_config(page_title="Value Finder Pro", layout="wide")
 st.title("🏇 Value Finder Pro: Ledger Edition")
 
-# Initialize Session State so results stay visible after clicking 'Log'
 if 'value_horses' not in st.session_state:
     st.session_state.value_horses = []
 if 'all_races' not in st.session_state:
     st.session_state.all_races = []
 
-# --- 2. THE SECURE CONNECTION ---
+# --- 2. SECURE CONNECTION ---
 try:
-    # Uses the [connections.gsheets] info you just fixed!
     conn = st.connection("gsheets", type=GSheetsConnection, ttl=0)
     st.sidebar.success("🔒 Secure API Linked")
 except Exception as e:
@@ -36,17 +34,27 @@ def load_ledger():
             pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Odds", "Score", "Result", "P/L"])
 
-# --- 3. ODDS & SCORING ---
+# --- 3. UPDATED FIX FOR YOUR ERROR ---
 def get_best_odds(runner):
+    # Check for Starting Price first
     sp_val = runner.get('sp_dec')
-    if sp_val and sp_val not in ['-', '', 'N/A', 'None']:
-        try: return float(sp_val)
-        except: pass
+    if sp_val and str(sp_val).replace('.','',1).isdigit():
+        return float(sp_val)
+    
     odds_list = runner.get('odds', [])
+    prices = []
+    
     if isinstance(odds_list, list):
-        prices = [float(e.get('decimal')) for e in odds_list if e.get('decimal') and e.get('decimal') not in ['-', 'SP', 'None']]
-        if prices: return max(prices)
-    return 0.0
+        for e in odds_list:
+            val = e.get('decimal')
+            # Only try to convert if it's not None and not a dash/text
+            if val is not None and str(val) not in ['-', 'SP', 'None', '']:
+                try:
+                    prices.append(float(val))
+                except (ValueError, TypeError):
+                    continue # Skip this specific price if it's invalid
+    
+    return max(prices) if prices else 0.0
 
 def get_score(h):
     s = 0
@@ -64,14 +72,6 @@ def get_score(h):
 # --- 4. MAIN INTERFACE ---
 st.sidebar.header("⚙️ Controls")
 min_score = st.sidebar.slider("Minimum Value Score", 0, 50, 20, 5)
-
-if st.sidebar.button("🔄 Reconcile Results"):
-    ledger = load_ledger()
-    if not ledger.empty and "Pending" in ledger['Result'].values:
-        with st.sidebar:
-            st.info("Checking for winners...")
-            # API logic for results would go here
-            st.warning("Feature: Result checking in progress...")
 
 if st.button('🚀 Run Analysis'):
     with st.spinner("Analyzing today's value..."):
@@ -98,14 +98,13 @@ if st.button('🚀 Run Analysis'):
                             "P/L": 0.0
                         })
 
-# SHOW TOP BETS
 if st.session_state.value_horses:
     st.markdown("### 🏆 Top Daily Value Bets")
     top_3 = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)[:3]
     cols = st.columns(3)
     for i, h in enumerate(top_3):
         with cols[i]:
-            st.success(f"### {h['Horse']}\n**{int(h['Odds']-1)}/1** \nScore: {h['Score']}")
+            st.success(f"### {h['Horse']}\n**{int(h['Odds']-1) if h['Odds'] > 1 else 'SP'}/1** \nScore: {h['Score']}")
 
     st.markdown("---")
     if st.button("📤 LOG ALL VALUE BETS TO GOOGLE SHEETS"):
@@ -113,7 +112,6 @@ if st.session_state.value_horses:
             try:
                 ledger = load_ledger()
                 new_data = pd.DataFrame(st.session_state.value_horses)
-                # Avoid logging the same horse twice
                 filtered = new_data[~new_data['Horse'].isin(ledger['Horse'])]
                 
                 if not filtered.empty:
@@ -126,7 +124,6 @@ if st.session_state.value_horses:
             except Exception as e:
                 st.error(f"Logging Failed: {e}")
 
-# FULL BREAKDOWN
 if st.session_state.all_races:
     for race in st.session_state.all_races:
         with st.expander(f"🕒 {race.get('off_time', race.get('off'))} - {race.get('course')}"):
