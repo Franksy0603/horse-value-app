@@ -3,6 +3,8 @@ import pandas as pd
 import requests
 from requests.auth import HTTPBasicAuth
 from datetime import datetime
+
+# Safety check for the Google Sheets library
 try:
     from streamlit_gsheets import GSheetsConnection
     HAS_GSHEETS = True
@@ -17,8 +19,15 @@ GSHEET_URL = st.secrets.get("gsheet_url", "")
 st.set_page_config(page_title="Value Finder Pro", layout="wide")
 st.title("🏇 Value Finder Pro: Google Sheets Ledger")
 
-if not HAS_GSHEETS:
-    st.error("⚠️ Library missing: Please add 'st-gsheets-connection' to your requirements.txt file in GitHub.")
+# --- 2. SIDEBAR CONTROLS & LEDGER ---
+st.sidebar.header("⚙️ Controls")
+
+# RESTORED: The Score Slider
+min_score = st.sidebar.slider("Minimum Value Score", min_value=0, max_value=50, value=20, step=5)
+st.sidebar.caption(f"Showing horses with score ≥ {min_score}")
+
+st.sidebar.markdown("---")
+st.sidebar.header("📊 Performance Ledger")
 
 # Establish Google Sheets Connection
 conn = None
@@ -26,10 +35,7 @@ if HAS_GSHEETS and GSHEET_URL:
     try:
         conn = st.connection("gsheets", type=GSheetsConnection)
     except:
-        st.warning("Could not connect to Google Sheets. Check your URL in Secrets.")
-
-# --- 2. SIDEBAR PERFORMANCE TRACKER ---
-st.sidebar.header("📊 Performance Ledger")
+        st.sidebar.warning("⚠️ Sheet Connection Failed")
 
 def load_ledger():
     if conn and GSHEET_URL:
@@ -48,11 +54,10 @@ if st.sidebar.button("🔄 Reconcile Results"):
                 res = requests.get("https://api.theracingapi.com/v1/results", auth=auth)
                 results_data = res.json().get('results', [])
                 
-                winners = []
-                for race in results_data:
-                    for runner in race.get('runners', []):
-                        if str(runner.get('position')) == "1":
-                            winners.append(str(runner.get('horse')).upper().strip())
+                winners = [str(runner.get('horse')).upper().strip() 
+                           for race in results_data 
+                           for runner in race.get('runners', []) 
+                           if str(runner.get('position')) == "1"]
                 
                 def process_row(row):
                     if row['Result'] == "Pending":
@@ -69,8 +74,6 @@ if st.sidebar.button("🔄 Reconcile Results"):
                 if conn:
                     conn.update(spreadsheet=GSHEET_URL, data=updated_ledger)
                     st.sidebar.success("Sheet Updated!")
-    else:
-        st.sidebar.info("No 'Pending' bets found.")
 
 # --- 3. SCORING & ODDS LOGIC ---
 def get_best_odds(runner):
@@ -80,26 +83,21 @@ def get_best_odds(runner):
         except: pass
     
     odds_list = runner.get('odds', [])
-    if isinstance(odds_list, list) and len(odds_list) > 0:
-        prices = []
-        for entry in odds_list:
-            d_val = entry.get('decimal')
-            if d_val and d_val not in ['-', 'SP', '', 'None']:
-                try: prices.append(float(d_val))
-                except: continue
+    if isinstance(odds_list, list) and len(odds_list):
+        prices = [float(e.get('decimal')) for e in odds_list if e.get('decimal') and e.get('decimal') not in ['-', 'SP', 'None']]
         if prices: return max(prices)
     return 0.0
 
 def get_score(h):
     s = 0
     form = str(h.get('form', ''))
-    if form and form.endswith('1'): s += 15
+    if form.endswith('1'): s += 15
     t_stats = h.get('trainer_14_days', {})
     if isinstance(t_stats, dict):
         try:
-            t_win = float(t_stats.get('percent', 0))
-            if t_win > 25: s += 20
-            elif t_win > 15: s += 10
+            win_pc = float(t_stats.get('percent', 0))
+            if win_pc > 25: s += 20
+            elif win_pc > 15: s += 10
         except: pass
     rtf = str(h.get('trainer_rtf', '0')).replace('%','')
     try:
@@ -124,7 +122,8 @@ if st.button('🚀 Run Analysis'):
             for r in race.get('runners', []):
                 odds = get_best_odds(r)
                 score = get_score(r)
-                if score >= 20 and odds >= 5.0:
+                # USE THE SLIDER VALUE HERE
+                if score >= min_score and odds >= 5.0:
                     all_value_horses.append({
                         "Date": datetime.now().strftime("%Y-%m-%d"),
                         "Horse": r.get('horse'),
@@ -136,38 +135,20 @@ if st.button('🚀 Run Analysis'):
                     })
 
         if all_value_horses:
-            st.subheader("🌟 Top 3 Daily Value Bets")
+            st.subheader(f"🌟 Value Bets (Score {min_score}+)")
             top_3 = sorted(all_value_horses, key=lambda x: x['Score'], reverse=True)[:3]
             cols = st.columns(3)
             for i, h in enumerate(top_3):
                 with cols[i]:
                     st.metric(label=f"{h['Horse']}", value=f"{int(h['Odds']-1)}/1", delta=f"Score: {h['Score']}")
             
-            if st.button("📤 Log Today's Value Bets to Google Sheets"):
-                if conn and GSHEET_URL:
+            if st.button("📤 Log Today's Value Bets"):
+                if conn:
                     existing = load_ledger()
                     new_bets = pd.DataFrame(all_value_horses)
-                    filtered_new = new_bets[~new_bets['Horse'].isin(existing['Horse'])]
-                    if not filtered_new.empty:
-                        updated_df = pd.concat([existing, filtered_new], ignore_index=True)
-                        conn.update(spreadsheet=GSHEET_URL, data=updated_df)
-                        st.success("Logged to the Cloud!")
-                    else:
-                        st.info("Already logged.")
-                else:
-                    st.error("Google Sheets connection not configured.")
-
-        for race in races:
-            with st.expander(f"🕒 {race.get('off_time', race.get('off'))} - {race.get('course')}"):
-                runners = race.get('runners', [])
-                table_data = []
-                for runner in runners:
-                    s = get_score(runner)
-                    o = get_best_odds(runner)
-                    table_data.append({
-                        "Horse": runner.get('horse'),
-                        "Score": s,
-                        "Odds": f"{int(o-1)}/1" if o > 1 else "SP",
-                        "Value": "💎 YES" if (s >= 20 and o >= 5.0) else ""
-                    })
-                st.table(pd.DataFrame(table_data))
+                    filtered = new_bets[~new_bets['Horse'].isin(existing['Horse'])]
+                    if not filtered.empty:
+                        conn.update(spreadsheet=GSHEET_URL, data=pd.concat([existing, filtered], ignore_index=True))
+                        st.success("Logged!")
+    else:
+        st.warning("No racing data found.")
