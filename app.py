@@ -21,6 +21,7 @@ only_show_value = st.sidebar.checkbox("Only show 'Value' bets", value=False)
 
 # --- 3. CORE LOGIC ---
 def get_best_odds(runner):
+    """Deep Scan for SP and Live Bookie Odds"""
     sp_val = runner.get('sp_dec')
     if sp_val and sp_val != '-':
         try: return float(sp_val)
@@ -28,16 +29,12 @@ def get_best_odds(runner):
     
     odds_list = runner.get('odds', [])
     if isinstance(odds_list, list) and len(odds_list) > 0:
-        prices = []
-        for entry in odds_list:
-            d_val = entry.get('decimal')
-            if d_val and d_val not in ['-', 'SP']:
-                try: prices.append(float(d_val))
-                except: pass
+        prices = [float(e.get('decimal')) for e in odds_list if e.get('decimal') and e.get('decimal') not in ['-', 'SP']]
         if prices: return max(prices)
     return 0.0
 
 def get_score(h):
+    """Scores based on Form, Trainer, and RTF"""
     s = 0
     form = str(h.get('form', ''))
     if form and form.endswith('1'): s += 15
@@ -55,11 +52,6 @@ def get_score(h):
         if float(rtf) > 50: s += 5
     except: pass
     return s
-
-def get_confidence(score):
-    if score >= 35: return "🔥 High"
-    if score >= 20: return "✅ Med"
-    return "❄️ Low"
 
 def style_table(row):
     styles = [''] * len(row)
@@ -85,8 +77,39 @@ if st.button('🚀 Run Analysis'):
     races = fetch_data()
     
     if not races:
-        st.warning("No live data found.")
+        st.warning("No live data found. Check back tomorrow morning.")
     else:
+        # Pre-process for TOP 3 VALUE BETS
+        all_value_horses = []
+        for race in races:
+            for r in race.get('runners', []):
+                odds = get_best_odds(r)
+                score = get_score(r)
+                prob = int((score / 50) * 100)
+                if score >= 20 and odds >= 5.0:
+                    all_value_horses.append({
+                        "Horse": r.get('horse'),
+                        "Course": race.get('course'),
+                        "Time": race.get('off_time', race.get('off')),
+                        "Score": score,
+                        "Prob": f"{prob}%",
+                        "Odds": f"{int(odds-1)}/1"
+                    })
+        
+        # Display Top 3 Summary
+        if all_value_horses:
+            st.subheader("🌟 Top 3 Daily Value Bets")
+            # Sort by Score (Probability) descending
+            top_3 = sorted(all_value_horses, key=lambda x: x['Score'], reverse=True)[:3]
+            cols = st.columns(3)
+            for i, horse in enumerate(top_3):
+                with cols[i]:
+                    st.metric(label=f"{horse['Time']} {horse['Course']}", value=horse['Horse'], delta=f"Value: {horse['Odds']}")
+                    st.caption(f"Confidence: {horse['Prob']} Probability")
+            st.divider()
+
+        # Display All Individual Race Meetings
+        st.subheader("📅 Today's Race Meetings")
         for race in races:
             runners = race.get('runners', [])
             course = race.get('course', 'Unknown')
@@ -95,24 +118,18 @@ if st.button('🚀 Run Analysis'):
             race_rows = []
             for r in runners:
                 if not r.get('horse'): continue
-                
                 odds_dec = get_best_odds(r)
                 score = get_score(r)
-                
                 if score < min_score: continue
                 
-                # Probability Calculation: (Score / Max Possible Score)
                 prob_pct = f"{int((score / 50) * 100)}%"
-                conf = get_confidence(score)
                 is_val = "💎 YES" if (score >= 20 and odds_dec >= 5.0) else ""
-                
                 if only_show_value and not is_val: continue
                 
                 race_rows.append({
                     "Horse": r.get('horse'),
                     "Score": score,
                     "Prob %": prob_pct,
-                    "Conf": conf,
                     "Odds": f"{int(odds_dec-1)}/1" if odds_dec > 1.0 else "N/A",
                     "Value": is_val
                 })
