@@ -11,11 +11,10 @@ API_PASS = st.secrets["API_PASS"]
 st.set_page_config(page_title="Value Finder Pro", layout="wide")
 st.title("🏇 Value Finder Pro: Standard Edition")
 
-# Initialize session state for the "Paper Trading" tracker
 if 'history' not in st.session_state:
     st.session_state.history = []
 
-# --- 2. CORE MATH & DEEP SCAN FUNCTIONS ---
+# --- 2. CORE MATH & PRICE DIVER ---
 def odds_to_dec(o):
     try:
         if not o or '/' not in str(o): return 0.0
@@ -24,55 +23,50 @@ def odds_to_dec(o):
     except: return 0.0
 
 def get_best_odds(runner):
-    """Deep scans the bookmaker dictionary to find any available price"""
-    # 1. Look for the dictionary of bookies
+    """Aggressively hunts for any price: Live, SP, or Best Odds"""
+    # 1. Check for Starting Price (Crucial for finished races)
+    sp = runner.get('sp') or runner.get('starting_price')
+    if sp and isinstance(sp, str) and '/' in sp:
+        return odds_to_dec(sp)
+
+    # 2. Check for the dictionary of multiple bookies
     bookies = runner.get('bookmaker_odds', {})
-    
-    # 2. If it's empty, check for common fallback fields
-    if not bookies or not isinstance(bookies, dict):
-        fallback = runner.get('odds') or runner.get('best_odds') or runner.get('sp_odds')
-        if fallback and isinstance(fallback, str):
-            return odds_to_dec(fallback)
-        return 0.0
-    
-    decimal_prices = []
-    # 3. Loop through every bookmaker entry provided
-    for val in bookies.values():
-        if isinstance(val, str) and '/' in val:
-            dec = odds_to_dec(val)
-            if dec > 1.0: decimal_prices.append(dec)
-        elif isinstance(val, (int, float)):
-            if float(val) > 1.0: decimal_prices.append(float(val))
-            
-    # 4. Return the highest price found
-    return max(decimal_prices) if decimal_prices else 0.0
+    if isinstance(bookies, dict) and bookies:
+        decimal_prices = []
+        for val in bookies.values():
+            if isinstance(val, str) and '/' in val:
+                dec = odds_to_dec(val)
+                if dec > 1.0: decimal_prices.append(dec)
+        if decimal_prices:
+            return max(decimal_prices)
+
+    # 3. Last resort fallback fields
+    fallback = runner.get('odds') or runner.get('best_odds')
+    if fallback and isinstance(fallback, str) and '/' in fallback:
+        return odds_to_dec(fallback)
+        
+    return 0.0
 
 def get_score(h, race_going):
-    """Standard Tier Scoring: Updated for flexible data reading"""
+    """Scores based on Form and Trainer Stats"""
     s = 0
-    # 1. Form check (Checks 'form' string or 'last_run_result')
+    # Form Check
     form = str(h.get('form', h.get('last_run_result', '')))
     if form and form[-1] == '1': s += 15
     
-    # 2. Trainer check (handles stats dict or flat field)
+    # Trainer Check
     t_stats = h.get('trainer_stats', {})
-    t_win = 0
-    if isinstance(t_stats, dict):
-        t_win = t_stats.get('win_percentage', 0)
-    else:
-        t_win = h.get('trainer_win_percentage', 0)
-        
+    t_win = t_stats.get('win_percentage', h.get('trainer_win_percentage', 0)) if isinstance(t_stats, dict) else 0
     if t_win > 25: s += 20
     elif t_win > 15: s += 10
     
-    # 3. Ground check
+    # Ground Check
     horse_best = str(h.get('best_going', h.get('going_preference', ''))).lower()
     if race_going and str(race_going).lower() in horse_best:
         s += 10 
     return s
 
 def highlight_value(row):
-    """Turns Value Bet rows Gold"""
     if row['Value'] == "💎 YES":
         return ['background-color: #FFD700; color: black; font-weight: bold'] * len(row)
     return [''] * len(row)
@@ -88,7 +82,7 @@ def get_data():
     except: pass
     return []
 
-# --- 4. SIDEBAR TRACKER ---
+# --- 4. SIDEBAR ---
 st.sidebar.header("⚙️ Strategy Filters")
 min_score = st.sidebar.slider("Minimum Horse Score", 0, 50, 0)
 only_show_value = st.sidebar.checkbox("Only show 'Value' bets", value=False)
@@ -110,31 +104,23 @@ if st.button('🚀 Run Analysis'):
     races = get_data()
     
     if not races:
-        st.warning("No data found. Check your API credentials and Tier.")
+        st.warning("No data found. Check your API credentials.")
     else:
-        current_time = datetime.now().strftime("%H:%M:%S")
-        st.info(f"Last updated at: {current_time}")
-        
+        st.info(f"Last updated at: {datetime.now().strftime('%H:%M:%S')}")
         all_export_data = [] 
         total_v = 0
 
         for race in races:
             runners = race.get('runners', [])
             race_going = race.get('going', '')
-            
             for r in runners:
                 best_dec = get_best_odds(r)
                 score = get_score(r, race_going)
-                
-                # Value Logic: Score 20+ and Odds 5.0 (4/1) or better
                 is_v = score >= 20 and best_dec >= 5.0
-                
-                # Display Odds Formatting
                 display_odds = f"{int(best_dec-1)}/1" if best_dec > 1.0 else "N/A"
                 
                 if score >= min_score:
                     if only_show_value and not is_v: continue
-                    
                     all_export_data.append({
                         "Time": race.get('off_time'),
                         "Course": race.get('course'),
@@ -145,22 +131,19 @@ if st.button('🚀 Run Analysis'):
                     })
                     if is_v: total_v += 1
 
-        # Dashboard Metrics
         c1, c2, c3 = st.columns(3)
         c1.metric("Meetings", len(races))
         c2.metric("Value Bets", total_v)
         c3.metric("API Tier", "Standard ✅")
 
-        # Meeting Expanders
         for race in races:
             m_rows = [row for row in all_export_data if row['Course'] == race.get('course') and row['Time'] == race.get('off_time')]
             if m_rows:
-                going_label = race.get('going', 'Unknown')
-                with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')} ({going_label})"):
+                with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')} ({race.get('going', 'Unknown')})"):
                     df_display = pd.DataFrame(m_rows)[["Horse", "Score", "Odds", "Value"]]
                     st.dataframe(df_display.style.apply(highlight_value, axis=1), use_container_width=True, hide_index=True)
                     
-                    # Manual Result Logger
+                    # Result Logger
                     h_list = [row['Horse'] for row in m_rows]
                     selected_h = st.selectbox("Log Result:", ["- Select Horse -"] + h_list, key=f"log_{race.get('off_time')}_{race.get('course')}")
                     cw, cl = st.columns(2)
