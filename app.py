@@ -24,12 +24,12 @@ def odds_to_dec(o):
 
 def get_best_odds(runner):
     """Aggressively hunts for any price: Live, SP, or Fallbacks"""
-    # 1. Check Starting Price first (often available after race)
+    # 1. Check Starting Price first (for finished races)
     sp = runner.get('sp') or runner.get('starting_price')
     if sp and isinstance(sp, str) and '/' in sp:
         return odds_to_dec(sp)
 
-    # 2. Check the dictionary of multiple bookies (Standard Tier)
+    # 2. Check the dictionary of multiple bookies
     bookies = runner.get('bookmaker_odds', {})
     if isinstance(bookies, dict) and bookies:
         decimal_prices = []
@@ -50,7 +50,7 @@ def get_best_odds(runner):
 def get_score(h, race_going):
     """Scores based on Form and Trainer Stats"""
     s = 0
-    # Form Check (Checks 'form' string or 'last_run_result')
+    # Form Check
     form = str(h.get('form', h.get('last_run_result', '')))
     if form and form[-1] == '1': s += 15
     
@@ -77,17 +77,29 @@ def highlight_value(row):
         return ['background-color: #FFD700; color: black; font-weight: bold'] * len(row)
     return [''] * len(row)
 
-# --- 3. DATA FETCH ---
+# --- 3. DUAL-FETCH DATA SYSTEM ---
 @st.cache_data(ttl=60)
-def get_data():
-    url = "https://api.theracingapi.com/v1/racecards/standard"
+def get_combined_data():
+    """Tries Standard Cards, then falls back to Results for finished races"""
+    headers = {"Accept": "application/json"}
+    auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
+    
+    # Try Standard Cards
+    url_cards = "https://api.theracingapi.com/v1/racecards/standard"
     try:
-        r = requests.get(url, auth=HTTPBasicAuth(API_USER.strip(), API_PASS.strip()), timeout=15)
-        if r.status_code == 200:
-            return r.json().get('racecards', [])
+        r = requests.get(url_cards, auth=auth, timeout=15)
+        cards = r.json().get('racecards', [])
+        
+        # If evening/late, try the Results endpoint for today's data
+        if not cards:
+            url_res = "https://api.theracingapi.com/v1/results"
+            r_res = requests.get(url_res, auth=auth, timeout=15)
+            cards = r_res.json().get('results', [])
+            
+        return cards
     except Exception as e:
-        st.error(f"API Connection Error: {e}")
-    return []
+        st.error(f"Connection Error: {e}")
+        return []
 
 # --- 4. SIDEBAR ---
 st.sidebar.header("⚙️ Strategy Filters")
@@ -108,10 +120,10 @@ if st.session_state.history:
 
 # --- 5. MAIN LOGIC ---
 if st.button('🚀 Run Analysis'):
-    races = get_data()
+    races = get_combined_data()
     
     if not races:
-        st.warning("No data found. Check your API credentials or Tier status.")
+        st.warning("No data found for today's cards or results.")
     else:
         st.info(f"Last updated at: {datetime.now().strftime('%H:%M:%S')}")
         all_export_data = [] 
@@ -119,17 +131,17 @@ if st.button('🚀 Run Analysis'):
 
         for race in races:
             runners = race.get('runners', [])
-            race_going = race.get('going', '')
             course_name = race.get('course', 'Unknown')
             off_time = race.get('off_time', '00:00')
+            race_going = race.get('going', '')
 
-            # --- DATA INSPECTOR TOOL ---
-            if st.checkbox(f"🔍 Inspect Raw Data: {off_time} - {course_name}", key=f"debug_{off_time}_{course_name}"):
-                if runners:
-                    st.write(f"First Runner Raw Data for {course_name}:")
-                    st.json(runners[0]) 
+            # --- CRASH-PROOF INSPECTOR ---
+            if st.checkbox(f"🔍 Inspect Raw Data: {off_time} - {course_name}", key=f"inspect_{off_time}_{course_name}"):
+                if runners and len(runners) > 0:
+                    st.write(f"Showing raw data for the first horse at {course_name}:")
+                    st.json(runners[0])
                 else:
-                    st.write("No runner data found for this race.")
+                    st.warning("No runner data available in this race object.")
 
             for r in runners:
                 best_dec = get_best_odds(r)
@@ -151,9 +163,9 @@ if st.button('🚀 Run Analysis'):
 
         # DASHBOARD
         c1, c2, c3 = st.columns(3)
-        c1.metric("Meetings", len(races))
+        c1.metric("Meetings Found", len(races))
         c2.metric("Value Bets", total_v)
-        c3.metric("API Tier", "Standard ✅")
+        c3.metric("API Status", "Connected ✅")
 
         # DISPLAY TABLES
         for race in races:
@@ -163,11 +175,11 @@ if st.button('🚀 Run Analysis'):
                     df_display = pd.DataFrame(m_rows)[["Horse", "Score", "Odds", "Value"]]
                     st.dataframe(df_display.style.apply(highlight_value, axis=1), use_container_width=True, hide_index=True)
                     
-                    # Result Logger for Test Week
+                    # Result Logger
                     h_list = [row['Horse'] for row in m_rows]
-                    selected_h = st.selectbox("Log Result:", ["- Select Horse -"] + h_list, key=f"log_{race.get('off_time')}_{race.get('course')}")
+                    selected_h = st.selectbox("Log Result:", ["- Select -"] + h_list, key=f"log_{race.get('off_time')}_{race.get('course')}")
                     cw, cl = st.columns(2)
-                    if selected_h != "- Select Horse -":
+                    if selected_h != "- Select -":
                         if cw.button(f"✅ Win", key=f"win_{selected_h}"):
                             st.session_state.history.append({"Horse": selected_h, "Result": "Win"})
                             st.toast(f"Logged Win for {selected_h}!")
