@@ -22,7 +22,7 @@ st.title("🏇 Value Finder Pro: Google Sheets Ledger")
 # --- 2. SIDEBAR CONTROLS & LEDGER ---
 st.sidebar.header("⚙️ Controls")
 
-# RESTORED: The Score Slider
+# The Score Slider
 min_score = st.sidebar.slider("Minimum Value Score", min_value=0, max_value=50, value=20, step=5)
 st.sidebar.caption(f"Showing horses with score ≥ {min_score}")
 
@@ -77,14 +77,23 @@ if st.sidebar.button("🔄 Reconcile Results"):
 
 # --- 3. SCORING & ODDS LOGIC ---
 def get_best_odds(runner):
+    """Robust version to prevent float() conversion errors"""
     sp_val = runner.get('sp_dec')
-    if sp_val and sp_val not in ['-', '', 'N/A']:
+    if sp_val and sp_val not in ['-', '', 'N/A', 'None']:
         try: return float(sp_val)
         except: pass
     
     odds_list = runner.get('odds', [])
-    if isinstance(odds_list, list) and len(odds_list):
-        prices = [float(e.get('decimal')) for e in odds_list if e.get('decimal') and e.get('decimal') not in ['-', 'SP', 'None']]
+    if isinstance(odds_list, list) and len(odds_list) > 0:
+        prices = []
+        for e in odds_list:
+            d_val = e.get('decimal')
+            # Check if d_val is actually a number or a string that looks like a number
+            if d_val is not None and d_val not in ['-', 'SP', 'None', '']:
+                try:
+                    prices.append(float(d_val))
+                except (ValueError, TypeError):
+                    continue # Skip this specific price if it's garbled
         if prices: return max(prices)
     return 0.0
 
@@ -122,7 +131,6 @@ if st.button('🚀 Run Analysis'):
             for r in race.get('runners', []):
                 odds = get_best_odds(r)
                 score = get_score(r)
-                # USE THE SLIDER VALUE HERE
                 if score >= min_score and odds >= 5.0:
                     all_value_horses.append({
                         "Date": datetime.now().strftime("%Y-%m-%d"),
@@ -150,5 +158,21 @@ if st.button('🚀 Run Analysis'):
                     if not filtered.empty:
                         conn.update(spreadsheet=GSHEET_URL, data=pd.concat([existing, filtered], ignore_index=True))
                         st.success("Logged!")
+        
+        # Breakdown Table
+        for race in races:
+            with st.expander(f"🕒 {race.get('off_time', race.get('off'))} - {race.get('course')}"):
+                runners = race.get('runners', [])
+                table_data = []
+                for runner in runners:
+                    s = get_score(runner)
+                    o = get_best_odds(runner)
+                    table_data.append({
+                        "Horse": runner.get('horse'),
+                        "Score": s,
+                        "Odds": f"{int(o-1)}/1" if o > 1 else "SP",
+                        "Value": "💎 YES" if (s >= 20 and o >= 5.0) else ""
+                    })
+                st.table(pd.DataFrame(table_data))
     else:
         st.warning("No racing data found.")
