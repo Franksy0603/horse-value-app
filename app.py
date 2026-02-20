@@ -15,7 +15,7 @@ st.title("🏇 Value Finder Pro: Standard Edition")
 if 'history' not in st.session_state:
     st.session_state.history = []
 
-# --- 2. CORE LOGIC ---
+# --- 2. CORE MATH FUNCTIONS ---
 def odds_to_dec(o):
     try:
         if not o or '/' not in str(o): return 0.0
@@ -23,24 +23,39 @@ def odds_to_dec(o):
         return (float(n) / float(d)) + 1.0
     except: return 0.0
 
-def get_score(h, race_going):
-    """Calculates score using Standard Tier performance data"""
-    s = 0
-    res = str(h.get('last_run_result', ''))
-    if res == '1': s += 15
+def get_best_odds(runner):
+    """Picks the highest available decimal odds from the bookmaker list"""
+    bookies = runner.get('bookmaker_odds', {})
+    if not bookies: return 0.0
     
-    t_win = h.get('trainer_win_percentage', 0)
+    decimal_prices = []
+    for price in bookies.values():
+        dec = odds_to_dec(price)
+        if dec > 0: decimal_prices.append(dec)
+    
+    return max(decimal_prices) if decimal_prices else 0.0
+
+def get_score(h, race_going):
+    """Standard Tier Scoring: Uses 'form' and 'trainer_stats'"""
+    s = 0
+    # Last Run Logic (Check if last race in form string was a '1')
+    form = str(h.get('form', ''))
+    if form and form[-1] == '1': s += 15
+    
+    # Trainer Stats logic
+    t_stats = h.get('trainer_stats', {})
+    t_win = t_stats.get('win_percentage', 0)
     if t_win > 25: s += 20
     elif t_win > 15: s += 10
     
-    horse_best_ground = str(h.get('best_going', '')).lower()
-    if race_going and horse_best_ground:
-        if str(race_going).lower() in horse_best_ground:
-            s += 10 
+    # Ground Preference
+    horse_best = str(h.get('best_going', '')).lower()
+    if race_going and str(race_going).lower() in horse_best:
+        s += 10 
     return s
 
 def highlight_value(row):
-    """Gold highlight for Value bets"""
+    """Turns Value Bet rows Gold"""
     if row['Value'] == "💎 YES":
         return ['background-color: #FFD700; color: black; font-weight: bold'] * len(row)
     return [''] * len(row)
@@ -57,13 +72,13 @@ def get_data():
     except: pass
     return []
 
-# --- 4. SIDEBAR & TRACKER ---
+# --- 4. SIDEBAR TRACKER ---
 st.sidebar.header("⚙️ Strategy Filters")
-min_score = st.sidebar.slider("Minimum Horse Score", 0, 50, 20)
+min_score = st.sidebar.slider("Minimum Horse Score", 0, 50, 0) # Set to 0 to see all data during testing
 only_show_value = st.sidebar.checkbox("Only show 'Value' bets", value=False)
 
 st.sidebar.divider()
-st.sidebar.header("📊 Test Week Tracker")
+st.sidebar.header("📊 Test Week Results")
 if st.session_state.history:
     df_h = pd.DataFrame(st.session_state.history)
     wins = df_h[df_h['Result'] == 'Win'].shape[0]
@@ -74,7 +89,7 @@ if st.session_state.history:
         st.session_state.history = []
         st.rerun()
 
-# --- 5. MAIN DISPLAY ---
+# --- 5. MAIN LOGIC ---
 if st.button('🚀 Run Analysis'):
     races = get_data()
     
@@ -92,11 +107,14 @@ if st.button('🚀 Run Analysis'):
             race_going = race.get('going', '')
             
             for r in runners:
+                best_dec = get_best_odds(r)
                 score = get_score(r, race_going)
-                odds = r.get('odds', 'N/A')
-                dec = odds_to_dec(odds)
-                # Value Logic: Score 20+ and Odds 4/1+
-                is_v = score >= 20 and dec >= 5.0
+                
+                # Value Logic: Score 20+ and Odds 5.0 (4/1) or better
+                is_v = score >= 20 and best_dec >= 5.0
+                
+                # Format odds for display (e.g., "5.0" back to "4/1")
+                display_odds = f"{int(best_dec-1)}/1" if best_dec > 0 else "N/A"
                 
                 if score >= min_score:
                     if only_show_value and not is_v: continue
@@ -106,32 +124,33 @@ if st.button('🚀 Run Analysis'):
                         "Course": race.get('course'),
                         "Horse": r.get('horse'),
                         "Score": score,
-                        "Odds": odds,
+                        "Odds": display_odds,
                         "Value": "💎 YES" if is_v else ""
                     })
                     if is_v: total_v += 1
 
-        # Dashboard
+        # Dashboard Metrics
         c1, c2, c3 = st.columns(3)
         c1.metric("Meetings", len(races))
         c2.metric("Value Bets", total_v)
-        c3.metric("Mode", "Standard Data")
+        c3.metric("Mode", "Standard Data ✅")
 
-        # Tables with Tracker
+        # Meeting Expanders
         for race in races:
             m_rows = [row for row in all_export_data if row['Course'] == race.get('course') and row['Time'] == race.get('off_time')]
             if m_rows:
-                with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')}"):
+                with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')} ({race.get('going', 'Unknown')})"):
                     df_display = pd.DataFrame(m_rows)[["Horse", "Score", "Odds", "Value"]]
                     st.dataframe(df_display.style.apply(highlight_value, axis=1), use_container_width=True, hide_index=True)
                     
-                    # Quick Log for Testing
-                    horse_list = [row['Horse'] for row in m_rows]
-                    selected_h = st.selectbox("Log Result for:", ["None"] + horse_list, key=f"sel_{race.get('off_time')}")
-                    col_w, col_l = st.columns(2)
-                    if selected_h != "None":
-                        if col_w.button(f"✅ {selected_h} Won", key=f"w_{selected_h}"):
+                    # Manual Result Logger
+                    h_list = [row['Horse'] for row in m_rows]
+                    selected_h = st.selectbox("Log Result:", ["- Select Horse -"] + h_list, key=f"log_{race.get('off_time')}_{race.get('course')}")
+                    cw, cl = st.columns(2)
+                    if selected_h != "- Select Horse -":
+                        if cw.button(f"✅ Win", key=f"win_{selected_h}"):
                             st.session_state.history.append({"Horse": selected_h, "Result": "Win"})
                             st.toast(f"Logged Win for {selected_h}!")
-                        if col_l.button(f"❌ {selected_h} Lost", key=f"l_{selected_h}"):
+                        if cl.button(f"❌ Loss", key=f"loss_{selected_h}"):
                             st.session_state.history.append({"Horse": selected_h, "Result": "Loss"})
+                            st.toast(f"Logged Loss for {selected_h}")
