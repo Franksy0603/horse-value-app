@@ -12,13 +12,18 @@ except ImportError:
     HAS_GSHEETS = False
 
 # --- 1. SETTINGS & SECRETS ---
-# We use st.secrets.get to ensure we aren't pulling cached empty strings
 API_USER = st.secrets.get("API_USER", "")
 API_PASS = st.secrets.get("API_PASS", "")
 GSHEET_URL = st.secrets.get("gsheet_url", "")
 
 st.set_page_config(page_title="Value Finder Pro", layout="wide")
 st.title("🏇 Value Finder Pro: Ledger Edition")
+
+# Initialize Session State so results don't disappear
+if 'value_horses' not in st.session_state:
+    st.session_state.value_horses = []
+if 'all_races' not in st.session_state:
+    st.session_state.all_races = []
 
 # --- 2. SIDEBAR CONTROLS ---
 st.sidebar.header("⚙️ Controls")
@@ -27,11 +32,9 @@ min_score = st.sidebar.slider("Minimum Value Score", 0, 50, 20, 5)
 st.sidebar.markdown("---")
 st.sidebar.header("📊 Performance Ledger")
 
-# Establish a FRESH connection every time to avoid caching the old URL
 conn = None
 if HAS_GSHEETS and GSHEET_URL:
     try:
-        # The 'ttl=0' tells Streamlit not to cache the connection
         conn = st.connection("gsheets", type=GSheetsConnection, ttl=0)
         st.sidebar.success("✅ Sheets API Linked")
     except Exception as e:
@@ -41,11 +44,10 @@ def load_ledger():
     if conn and GSHEET_URL:
         try:
             return conn.read(spreadsheet=GSHEET_URL, ttl=0)
-        except Exception as e:
-            st.error(f"Failed to read sheet: {e}")
+        except Exception:
+            pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Odds", "Score", "Result", "P/L"])
 
-# RECONCILE BUTTON (Update winners from results)
 if st.sidebar.button("🔄 Reconcile Results"):
     ledger = load_ledger()
     if not ledger.empty and "Pending" in ledger['Result'].values:
@@ -71,15 +73,12 @@ if st.sidebar.button("🔄 Reconcile Results"):
                                 row['P/L'] = -1.0
                         return row
                     updated_ledger = ledger.apply(process_row, axis=1)
-                    # We pass the URL directly into the update to bypass any cache
                     conn.update(spreadsheet=GSHEET_URL, data=updated_ledger)
                     status.success("✅ Ledger Updated!")
                 else:
-                    status.warning("No new winners found yet.")
+                    status.warning("No new winners found.")
             except Exception as e:
-                status.error(f"Update failed: {str(e)}")
-    else:
-        st.sidebar.info("No 'Pending' rows found to reconcile.")
+                status.error(f"Error: {str(e)}")
 
 # --- 3. ODDS & SCORING ---
 def get_best_odds(runner):
@@ -117,81 +116,73 @@ def get_score(h):
 
 # --- 4. MAIN ANALYSIS ---
 if st.button('🚀 Run Analysis'):
-    auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
-    r = requests.get("https://api.theracingapi.com/v1/racecards/standard", auth=auth)
-    races = r.json().get('racecards', [])
-    if not races:
-        r = requests.get("https://api.theracingapi.com/v1/results", auth=auth)
-        races = r.json().get('results', [])
+    with st.spinner("Fetching Racecards..."):
+        auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
+        r = requests.get("https://api.theracingapi.com/v1/racecards/standard", auth=auth)
+        races = r.json().get('racecards', [])
+        
+        st.session_state.all_races = races
+        st.session_state.value_horses = []
+        
+        if races:
+            for race in races:
+                for r_data in race.get('runners', []):
+                    odds = get_best_odds(r_data)
+                    score = get_score(r_data)
+                    if score >= min_score and odds >= 5.0:
+                        st.session_state.value_horses.append({
+                            "Date": datetime.now().strftime("%Y-%m-%d"),
+                            "Horse": r_data.get('horse'),
+                            "Course": race.get('course'),
+                            "Odds": odds,
+                            "Score": score,
+                            "Result": "Pending",
+                            "P/L": 0.0
+                        })
 
-    if races:
-        all_value_horses = []
-        for race in races:
-            for r_data in race.get('runners', []):
-                odds = get_best_odds(r_data)
-                score = get_score(r_data)
-                if score >= min_score and odds >= 5.0:
-                    all_value_horses.append({
-                        "Date": datetime.now().strftime("%Y-%m-%d"),
-                        "Horse": r_data.get('horse'),
-                        "Course": race.get('course'),
-                        "Odds": odds,
-                        "Score": score,
-                        "Result": "Pending",
-                        "P/L": 0.0
-                    })
+# DISPLAY RESULTS IF THEY EXIST
+if st.session_state.value_horses:
+    st.markdown("### 🏆 Top Value Bets")
+    top_3 = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)[:3]
+    cols = st.columns(3)
+    for i, h in enumerate(top_3):
+        with cols[i]:
+            # This 'st.success' creates the green/gold highlighted block
+            st.success(f"### {h['Horse']}")
+            st.write(f"**Score:** {h['Score']} | **Odds:** {int(h['Odds']-1)}/1")
 
-        if all_value_horses:
-            st.markdown("### 🏆 GOLD VALUE BETS")
-            top_3 = sorted(all_value_horses, key=lambda x: x['Score'], reverse=True)[:3]
-            cols = st.columns(3)
-            for i, h in enumerate(top_3):
-                with cols[i]:
-                    st.markdown(f"""
-                    <div style="background-color:#FFD700; padding:20px; border-radius:10px; border:2px solid #DAA520; text-align:center;">
-                        <h2 style="color:#000; margin:0;">{h['Horse']}</h2>
-                        <p style="color:#000; font-size:20px; margin:5px;"><b>Score: {h['Score']}</b></p>
-                        <p style="color:#000; font-size:18px; margin:0;">Odds: {int(h['Odds']-1)}/1</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-            
-            st.markdown("<br>", unsafe_allow_html=True)
-            # LOGGING LOGIC
-            if st.button("📤 LOG SELECTIONS"):
-                if conn:
-                    try:
-                        # 1. Load fresh
-                        existing = load_ledger()
-                        # 2. Compare
-                        new_bets = pd.DataFrame(all_value_horses)
-                        filtered = new_bets[~new_bets['Horse'].isin(existing['Horse'])]
-                        
-                        if not filtered.empty:
-                            # 3. Combine and Update
-                            updated_df = pd.concat([existing, filtered], ignore_index=True)
-                            conn.update(spreadsheet=GSHEET_URL, data=updated_df)
-                            st.balloons()
-                            st.success(f"Success! {len(filtered)} horses added to the Google Sheet.")
-                        else:
-                            st.warning("These horses are already logged for today.")
-                    except Exception as e:
-                        st.error(f"Log Failed: {e}")
-                        st.info("Check: Is the Google Sheet shared as 'Anyone with the link can EDIT'?")
+    st.markdown("---")
+    if st.button("📤 LOG SELECTIONS TO GOOGLE SHEETS"):
+        if conn:
+            try:
+                existing = load_ledger()
+                new_data = pd.DataFrame(st.session_state.value_horses)
+                # Avoid duplicates
+                filtered = new_data[~new_data['Horse'].isin(existing['Horse'])]
+                
+                if not filtered.empty:
+                    updated_df = pd.concat([existing, filtered], ignore_index=True)
+                    conn.update(spreadsheet=GSHEET_URL, data=updated_df)
+                    st.balloons()
+                    st.success(f"Logged {len(filtered)} horses!")
                 else:
-                    st.error("No Sheet connection found.")
+                    st.info("Horses already in ledger.")
+            except Exception as e:
+                st.error(f"Logging Failed: {e}")
 
-        # Full Race List Breakdown
-        for race in races:
-            with st.expander(f"🕒 {race.get('off_time', race.get('off'))} - {race.get('course')}"):
-                runners = race.get('runners', [])
-                table_data = []
-                for runner in runners:
-                    s = get_score(runner)
-                    o = get_best_odds(runner)
-                    table_data.append({
-                        "Horse": runner.get('horse'),
-                        "Score": s,
-                        "Odds": f"{int(o-1)}/1" if o > 1 else "SP",
-                        "Value": "💎 VALUE" if (s >= min_score and o >= 5.0) else ""
-                    })
-                st.table(pd.DataFrame(table_data))
+# Breakdown Tables
+if st.session_state.all_races:
+    for race in st.session_state.all_races:
+        with st.expander(f"🕒 {race.get('off_time', race.get('off'))} - {race.get('course')}"):
+            runners = race.get('runners', [])
+            table_data = []
+            for runner in runners:
+                s = get_score(runner)
+                o = get_best_odds(runner)
+                table_data.append({
+                    "Horse": runner.get('horse'),
+                    "Score": s,
+                    "Odds": f"{int(o-1)}/1" if o > 1 else "SP",
+                    "Value": "💎 VALUE" if (s >= min_score and o >= 5.0) else ""
+                })
+            st.table(pd.DataFrame(table_data))
