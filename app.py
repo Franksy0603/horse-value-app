@@ -34,7 +34,42 @@ def load_ledger():
             pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Result", "P/L"])
 
-# --- 3. DATA PROCESSING ---
+# --- 3. SIDEBAR P&L DASHBOARD ---
+def display_sidebar_stats():
+    st.sidebar.markdown("---")
+    st.sidebar.header("📊 Performance Ledger")
+    
+    df = load_ledger()
+    
+    if not df.empty:
+        # Calculate Stats
+        # We ensure P/L is numeric for calculation
+        df['P/L'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
+        total_pl = df['P/L'].sum()
+        total_bets = len(df[df['Result'] != 'Pending'])
+        winners = len(df[df['Result'] == 'Winner'])
+        
+        win_rate = (winners / total_bets * 100) if total_bets > 0 else 0
+        
+        # Display Stats with color coding
+        pl_color = "green" if total_pl >= 0 else "red"
+        st.sidebar.markdown(f"### Total P/L: :{pl_color}[{total_pl:+.2f} pts]")
+        
+        col1, col2 = st.sidebar.columns(2)
+        col1.metric("Bets", total_bets)
+        col2.metric("Win Rate", f"{win_rate:.1f}%")
+        
+        if st.sidebar.button("🗑️ Clear Ledger (Careful!)"):
+            empty_df = pd.DataFrame(columns=df.columns)
+            conn.update(spreadsheet=GSHEET_URL, data=empty_df)
+            st.sidebar.warning("Ledger cleared. Refresh to see changes.")
+    else:
+        st.sidebar.info("Ledger is currently empty.")
+
+# Trigger Sidebar Display
+display_sidebar_stats()
+
+# --- 4. DATA PROCESSING ---
 def get_best_odds(runner):
     sp_val = runner.get('sp_dec')
     if sp_val and str(sp_val).replace('.','',1).isdigit():
@@ -63,8 +98,9 @@ def get_score(h):
         except: pass
     return s
 
-# --- 4. MAIN INTERFACE ---
-st.sidebar.header("⚙️ Controls")
+# --- 5. MAIN INTERFACE ---
+st.sidebar.markdown("---")
+st.sidebar.header("⚙️ Analysis Controls")
 min_score = st.sidebar.slider("Minimum Value Score", 0, 50, 20, 5)
 
 if st.button('🚀 Run Analysis'):
@@ -124,6 +160,7 @@ if st.session_state.value_horses:
                     conn.update(spreadsheet=GSHEET_URL, data=updated_df)
                     st.balloons()
                     st.success(f"Successfully logged {len(filtered)} bets!")
+                    st.rerun() # Refresh to update sidebar P/L
                 else:
                     st.info("These horses are already in your ledger.")
             except Exception as e:
