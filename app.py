@@ -21,27 +21,24 @@ st.title("🏇 Value Finder Pro: Google Sheets Ledger")
 
 # --- 2. SIDEBAR CONTROLS & LEDGER ---
 st.sidebar.header("⚙️ Controls")
-
-# The Score Slider
-min_score = st.sidebar.slider("Minimum Value Score", min_value=0, max_value=50, value=20, step=5)
+min_score = st.sidebar.slider("Minimum Value Score", 0, 50, 20, 5)
 st.sidebar.caption(f"Showing horses with score ≥ {min_score}")
 
 st.sidebar.markdown("---")
 st.sidebar.header("📊 Performance Ledger")
 
-# Establish Google Sheets Connection
 conn = None
 if HAS_GSHEETS and GSHEET_URL:
     try:
         conn = st.connection("gsheets", type=GSheetsConnection)
-    except:
+    except Exception:
         st.sidebar.warning("⚠️ Sheet Connection Failed")
 
 def load_ledger():
     if conn and GSHEET_URL:
         try:
             return conn.read(spreadsheet=GSHEET_URL, ttl=0)
-        except:
+        except Exception:
             pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Odds", "Score", "Result", "P/L"])
 
@@ -49,9 +46,11 @@ if st.sidebar.button("🔄 Reconcile Results"):
     ledger = load_ledger()
     if not ledger.empty and "Pending" in ledger['Result'].values:
         with st.sidebar:
-            with st.spinner("Scanning Results..."):
+            status = st.empty()
+            status.info("Checking API for winners...")
+            try:
                 auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
-                res = requests.get("https://api.theracingapi.com/v1/results", auth=auth)
+                res = requests.get("https://api.theracingapi.com/v1/results", auth=auth, timeout=15)
                 results_data = res.json().get('results', [])
                 
                 winners = [str(runner.get('horse')).upper().strip() 
@@ -59,25 +58,30 @@ if st.sidebar.button("🔄 Reconcile Results"):
                            for runner in race.get('runners', []) 
                            if str(runner.get('position')) == "1"]
                 
-                def process_row(row):
-                    if row['Result'] == "Pending":
-                        h_name = str(row['Horse']).upper().strip()
-                        if h_name in winners:
-                            row['Result'] = "Winner"
-                            row['P/L'] = float(row['Odds']) - 1
-                        elif len(winners) > 0:
-                            row['Result'] = "Loser"
-                            row['P/L'] = -1.0
-                    return row
+                if winners:
+                    def process_row(row):
+                        if row['Result'] == "Pending":
+                            h_name = str(row['Horse']).upper().strip()
+                            if h_name in winners:
+                                row['Result'] = "Winner"
+                                row['P/L'] = float(row['Odds']) - 1
+                            else:
+                                row['Result'] = "Loser"
+                                row['P/L'] = -1.0
+                        return row
 
-                updated_ledger = ledger.apply(process_row, axis=1)
-                if conn:
+                    updated_ledger = ledger.apply(process_row, axis=1)
                     conn.update(spreadsheet=GSHEET_URL, data=updated_ledger)
-                    st.sidebar.success("Sheet Updated!")
+                    status.success("Sheet Updated Successfully!")
+                else:
+                    status.warning("No new winners found in API yet.")
+            except Exception as e:
+                status.error(f"Error: {str(e)}")
+    else:
+        st.sidebar.info("No 'Pending' bets to update.")
 
 # --- 3. SCORING & ODDS LOGIC ---
 def get_best_odds(runner):
-    """Robust version to prevent float() conversion errors"""
     sp_val = runner.get('sp_dec')
     if sp_val and sp_val not in ['-', '', 'N/A', 'None']:
         try: return float(sp_val)
@@ -88,12 +92,9 @@ def get_best_odds(runner):
         prices = []
         for e in odds_list:
             d_val = e.get('decimal')
-            # Check if d_val is actually a number or a string that looks like a number
             if d_val is not None and d_val not in ['-', 'SP', 'None', '']:
-                try:
-                    prices.append(float(d_val))
-                except (ValueError, TypeError):
-                    continue # Skip this specific price if it's garbled
+                try: prices.append(float(d_val))
+                except: continue
         if prices: return max(prices)
     return 0.0
 
@@ -128,13 +129,13 @@ if st.button('🚀 Run Analysis'):
     if races:
         all_value_horses = []
         for race in races:
-            for r in race.get('runners', []):
-                odds = get_best_odds(r)
-                score = get_score(r)
+            for r_data in race.get('runners', []):
+                odds = get_best_odds(r_data)
+                score = get_score(r_data)
                 if score >= min_score and odds >= 5.0:
                     all_value_horses.append({
                         "Date": datetime.now().strftime("%Y-%m-%d"),
-                        "Horse": r.get('horse'),
+                        "Horse": r_data.get('horse'),
                         "Course": race.get('course'),
                         "Odds": odds,
                         "Score": score,
@@ -143,12 +144,15 @@ if st.button('🚀 Run Analysis'):
                     })
 
         if all_value_horses:
-            st.subheader(f"🌟 Value Bets (Score {min_score}+)")
+            st.markdown("### 🏆 Top Value Bets")
             top_3 = sorted(all_value_horses, key=lambda x: x['Score'], reverse=True)[:3]
             cols = st.columns(3)
             for i, h in enumerate(top_3):
                 with cols[i]:
-                    st.metric(label=f"{h['Horse']}", value=f"{int(h['Odds']-1)}/1", delta=f"Score: {h['Score']}")
+                    # Gold background container
+                    st.success(f"**{h['Horse']}**")
+                    st.metric(label="Score", value=h['Score'])
+                    st.write(f"**Odds:** {int(h['Odds']-1)}/1")
             
             if st.button("📤 Log Today's Value Bets"):
                 if conn:
@@ -156,10 +160,12 @@ if st.button('🚀 Run Analysis'):
                     new_bets = pd.DataFrame(all_value_horses)
                     filtered = new_bets[~new_bets['Horse'].isin(existing['Horse'])]
                     if not filtered.empty:
-                        conn.update(spreadsheet=GSHEET_URL, data=pd.concat([existing, filtered], ignore_index=True))
-                        st.success("Logged!")
+                        updated_df = pd.concat([existing, filtered], ignore_index=True)
+                        conn.update(spreadsheet=GSHEET_URL, data=updated_df)
+                        st.balloons()
+                        st.success("Successfully Logged to Google Sheets!")
         
-        # Breakdown Table
+        # Breakdown Tables
         for race in races:
             with st.expander(f"🕒 {race.get('off_time', race.get('off'))} - {race.get('course')}"):
                 runners = race.get('runners', [])
@@ -167,12 +173,14 @@ if st.button('🚀 Run Analysis'):
                 for runner in runners:
                     s = get_score(runner)
                     o = get_best_odds(runner)
+                    is_value = (s >= min_score and o >= 5.0)
                     table_data.append({
                         "Horse": runner.get('horse'),
                         "Score": s,
                         "Odds": f"{int(o-1)}/1" if o > 1 else "SP",
-                        "Value": "💎 YES" if (s >= 20 and o >= 5.0) else ""
+                        "Value": "💎 VALUE" if is_value else ""
                     })
-                st.table(pd.DataFrame(table_data))
+                df_display = pd.DataFrame(table_data)
+                st.table(df_display)
     else:
-        st.warning("No racing data found.")
+        st.warning("No data found. Check your API credentials.")
