@@ -4,7 +4,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 from datetime import datetime
 
-# --- 1. SETTINGS ---
+# --- 1. SETTINGS & PERSISTENCE ---
 API_USER = st.secrets["API_USER"]
 API_PASS = st.secrets["API_PASS"]
 
@@ -14,7 +14,22 @@ st.title("🏇 Value Finder Pro: Standard Edition")
 if 'history' not in st.session_state:
     st.session_state.history = []
 
-# --- 2. CORE LOGIC ---
+# --- 2. SIDEBAR (Fixed: Now permanently visible) ---
+st.sidebar.header("⚙️ Strategy Filters")
+# This slider must stay outside the button logic to remain visible
+min_score = st.sidebar.slider("Minimum Horse Score", 0, 50, 0)
+only_show_value = st.sidebar.checkbox("Only show 'Value' bets", value=False)
+
+if st.session_state.history:
+    st.sidebar.divider()
+    df_h = pd.DataFrame(st.session_state.history)
+    wins = len(df_h[df_h['Result'] == 'Win'])
+    st.sidebar.metric("Test Week Wins", f"{wins} / {len(df_h)}")
+    if st.sidebar.button("Clear History"):
+        st.session_state.history = []
+        st.rerun()
+
+# --- 3. CORE MATH ---
 def odds_to_dec(o):
     try:
         if not o or '/' not in str(o): return 0.0
@@ -23,15 +38,15 @@ def odds_to_dec(o):
     except: return 0.0
 
 def get_best_odds(runner):
-    """Aggressive scanner for live or archived prices"""
-    # 1. Primary: Live Bookmaker Dictionary
+    """Exhaustive search for any price field in Standard Tier"""
+    # Check Live Bookie dictionary first
     bookies = runner.get('bookmaker_odds', {})
     if isinstance(bookies, dict) and bookies:
         prices = [odds_to_dec(v) for v in bookies.values() if isinstance(v, str) and '/' in v]
         if prices: return max(prices)
-
-    # 2. Secondary: Explicit price fields
-    for field in ['sp', 'starting_price', 'off_price', 'odds', 'decimal_odds']:
+    
+    # Check fallback fields for finished or upcoming races
+    for field in ['sp', 'starting_price', 'odds', 'decimal_odds', 'off_price']:
         val = runner.get(field)
         if val:
             if isinstance(val, str) and '/' in val: return odds_to_dec(val)
@@ -39,25 +54,22 @@ def get_best_odds(runner):
     return 0.0
 
 def get_score(h, race_going):
-    """Scores based on Form and Trainer Stats"""
+    """Scores horses based on Form and Trainer Stats"""
     s = 0
-    # Form Check (Last run was a win)
     form = str(h.get('form', h.get('last_run_result', '')))
     if form and form[-1] == '1': s += 15
     
-    # Trainer Check (Requires API to send stats)
     t_stats = h.get('trainer_stats', {})
     t_win = t_stats.get('win_percentage', h.get('trainer_win_percentage', 0)) if isinstance(t_stats, dict) else 0
     if t_win > 25: s += 20
     elif t_win > 15: s += 10
     
-    # Ground Check
     horse_best = str(h.get('best_going', h.get('going_preference', ''))).lower()
     if race_going and str(race_going).lower() in horse_best: s += 10 
     return s
 
 def style_table(row):
-    """Standard Tier Styling: Gold for Value, Bold Red for Winners"""
+    """Gold for Value, Bold Red for Winners"""
     styles = [''] * len(row)
     if row['Value'] == "💎 YES":
         styles = ['background-color: #FFD700; color: black; font-weight: bold'] * len(row)
@@ -66,28 +78,28 @@ def style_table(row):
         styles[4] = 'font-weight: 900; color: #FF4B4B;'
     return styles
 
-# --- 3. DATA FETCH ---
+# --- 4. DATA FETCH ---
 @st.cache_data(ttl=60)
 def fetch_data():
     auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
     try:
-        # Check standard racecards
+        # Standard Racecards
         r = requests.get("https://api.theracingapi.com/v1/racecards/standard", auth=auth, timeout=15)
         data = r.json().get('racecards', [])
-        # Fallback to results if cards are empty
+        # Fallback to Results
         if not data:
             r = requests.get("https://api.theracingapi.com/v1/results", auth=auth, timeout=15)
             data = r.json().get('results', [])
         return data
     except: return []
 
-# --- 4. MAIN INTERFACE ---
+# --- 5. MAIN LOGIC ---
 if st.button('🚀 Run Analysis'):
     races = fetch_data()
     if not races:
-        st.warning("No data found. Try scanning closer to race time.")
+        st.warning("No data found. Checking morning cards is best.")
     else:
-        st.info(f"Scan complete: {datetime.now().strftime('%H:%M:%S')}")
+        st.info(f"Last Scan: {datetime.now().strftime('%H:%M:%S')}")
         for race in races:
             runners = race.get('runners', [])
             course = race.get('course', 'Unknown')
@@ -100,12 +112,14 @@ if st.button('🚀 Run Analysis'):
                 odds_dec = get_best_odds(r)
                 score = get_score(r, race_going)
                 
-                # Value Strategy: Score 20+ and Odds 4/1+ (5.0 decimal)
-                is_val = "💎 YES" if (score >= 20 and odds_dec >= 5.0) else ""
+                # Filtering based on sidebar slider
+                if score < min_score: continue
                 
-                # Winner Status
+                is_val = "💎 YES" if (score >= 20 and odds_dec >= 5.0) else ""
                 pos = str(r.get('position', '')).strip()
                 is_win = "🏆 WINNER" if pos == "1" else ""
+                
+                if only_show_value and not is_val: continue
                 
                 race_rows.append({
                     "Horse": r.get('horse'),
@@ -120,19 +134,12 @@ if st.button('🚀 Run Analysis'):
                     df = pd.DataFrame(race_rows)
                     st.dataframe(df.style.apply(style_table, axis=1), use_container_width=True, hide_index=True)
                     
-                    # Manual Logger
+                    # Result Logger
                     h_list = [row['Horse'] for row in race_rows]
-                    sel = st.selectbox("Log:", ["- Select -"] + h_list, key=f"log_{off_time}_{course}")
+                    sel = st.selectbox("Log Result:", ["- Select -"] + h_list, key=f"log_{off_time}_{course}")
                     if sel != "- Select -":
                         c1, c2 = st.columns(2)
                         if c1.button("✅ Win", key=f"w_{sel}"):
                             st.session_state.history.append({"Horse": sel, "Result": "Win"})
                         if c2.button("❌ Loss", key=f"l_{sel}"):
                             st.session_state.history.append({"Horse": sel, "Result": "Loss"})
-
-# Sidebar Test Results
-if st.session_state.history:
-    st.sidebar.divider()
-    df_h = pd.DataFrame(st.session_state.history)
-    wins = len(df_h[df_h['Result'] == 'Win'])
-    st.sidebar.metric("Test Week Wins", f"{wins} / {len(df_h)}")
