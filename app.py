@@ -2,7 +2,8 @@ import streamlit as st
 import pandas as pd
 import requests
 from requests.auth import HTTPBasicAuth
-from datetime import datetime
+from datetime import datetime, timezone
+import json
 
 # --- 1. SETTINGS & PERSISTENCE ---
 API_USER = st.secrets["API_USER"]
@@ -14,9 +15,8 @@ st.title("🏇 Value Finder Pro: Standard Edition")
 if 'history' not in st.session_state:
     st.session_state.history = []
 
-# --- 2. SIDEBAR (Fixed: Now permanently visible) ---
+# --- 2. SIDEBAR FILTERS (Fixed Positioning) ---
 st.sidebar.header("⚙️ Strategy Filters")
-# This slider must stay outside the button logic to remain visible
 min_score = st.sidebar.slider("Minimum Horse Score", 0, 50, 0)
 only_show_value = st.sidebar.checkbox("Only show 'Value' bets", value=False)
 
@@ -29,7 +29,7 @@ if st.session_state.history:
         st.session_state.history = []
         st.rerun()
 
-# --- 3. CORE MATH ---
+# --- 3. CORE LOGIC & DEEP SCAN ---
 def odds_to_dec(o):
     try:
         if not o or '/' not in str(o): return 0.0
@@ -38,15 +38,15 @@ def odds_to_dec(o):
     except: return 0.0
 
 def get_best_odds(runner):
-    """Exhaustive search for any price field in Standard Tier"""
-    # Check Live Bookie dictionary first
+    """Deepest possible scan for Standard Tier prices"""
     bookies = runner.get('bookmaker_odds', {})
     if isinstance(bookies, dict) and bookies:
         prices = [odds_to_dec(v) for v in bookies.values() if isinstance(v, str) and '/' in v]
         if prices: return max(prices)
     
-    # Check fallback fields for finished or upcoming races
-    for field in ['sp', 'starting_price', 'odds', 'decimal_odds', 'off_price']:
+    # Comprehensive fallback list for SP and off-market prices
+    fallbacks = ['sp', 'starting_price', 'odds', 'decimal_odds', 'off_price', 'traditional_odds', 'last_price']
+    for field in fallbacks:
         val = runner.get(field)
         if val:
             if isinstance(val, str) and '/' in val: return odds_to_dec(val)
@@ -54,7 +54,7 @@ def get_best_odds(runner):
     return 0.0
 
 def get_score(h, race_going):
-    """Scores horses based on Form and Trainer Stats"""
+    """Scores horses based on Form, Trainer Stats, and Going"""
     s = 0
     form = str(h.get('form', h.get('last_run_result', '')))
     if form and form[-1] == '1': s += 15
@@ -69,7 +69,7 @@ def get_score(h, race_going):
     return s
 
 def style_table(row):
-    """Gold for Value, Bold Red for Winners"""
+    """Visual cues: Gold for value, Bold Underline for winners"""
     styles = [''] * len(row)
     if row['Value'] == "💎 YES":
         styles = ['background-color: #FFD700; color: black; font-weight: bold'] * len(row)
@@ -83,23 +83,31 @@ def style_table(row):
 def fetch_data():
     auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
     try:
-        # Standard Racecards
         r = requests.get("https://api.theracingapi.com/v1/racecards/standard", auth=auth, timeout=15)
-        data = r.json().get('racecards', [])
-        # Fallback to Results
+        raw_json = r.json()
+        data = raw_json.get('racecards', [])
+        
+        # Automatic switch to results endpoint if cards are empty
         if not data:
             r = requests.get("https://api.theracingapi.com/v1/results", auth=auth, timeout=15)
-            data = r.json().get('results', [])
-        return data
-    except: return []
+            raw_json = r.json()
+            data = raw_json.get('results', [])
+            
+        return data, raw_json
+    except Exception as e:
+        return [], {"error": str(e)}
 
-# --- 5. MAIN LOGIC ---
+# --- 5. MAIN INTERFACE ---
 if st.button('🚀 Run Analysis'):
-    races = fetch_data()
+    races, raw_debug = fetch_data()
+    
     if not races:
-        st.warning("No data found. Checking morning cards is best.")
+        st.warning("No data found. This is normal during late-night or early-morning hours.")
     else:
-        st.info(f"Last Scan: {datetime.now().strftime('%H:%M:%S')}")
+        # Data Freshness Check
+        api_time_str = raw_debug.get('last_updated', datetime.now().strftime('%H:%M:%S'))
+        st.info(f"Last API Update: {api_time_str} | Dashboard Refresh: {datetime.now().strftime('%H:%M:%S')}")
+        
         for race in races:
             runners = race.get('runners', [])
             course = race.get('course', 'Unknown')
@@ -112,7 +120,6 @@ if st.button('🚀 Run Analysis'):
                 odds_dec = get_best_odds(r)
                 score = get_score(r, race_going)
                 
-                # Filtering based on sidebar slider
                 if score < min_score: continue
                 
                 is_val = "💎 YES" if (score >= 20 and odds_dec >= 5.0) else ""
@@ -134,12 +141,23 @@ if st.button('🚀 Run Analysis'):
                     df = pd.DataFrame(race_rows)
                     st.dataframe(df.style.apply(style_table, axis=1), use_container_width=True, hide_index=True)
                     
-                    # Result Logger
+                    # Manual Logger for Test Week
                     h_list = [row['Horse'] for row in race_rows]
                     sel = st.selectbox("Log Result:", ["- Select -"] + h_list, key=f"log_{off_time}_{course}")
                     if sel != "- Select -":
                         c1, c2 = st.columns(2)
                         if c1.button("✅ Win", key=f"w_{sel}"):
                             st.session_state.history.append({"Horse": sel, "Result": "Win"})
+                            st.toast(f"Logged Win: {sel}")
                         if c2.button("❌ Loss", key=f"l_{sel}"):
                             st.session_state.history.append({"Horse": sel, "Result": "Loss"})
+                            st.toast(f"Logged Loss: {sel}")
+
+        # --- 6. DIAGNOSTICS (At bottom) ---
+        st.divider()
+        with st.expander("🛠️ API Diagnostics (Raw Data Check)"):
+            st.write("Examine the raw data fields below if odds show as 'N/A'.")
+            if races and len(races) > 0 and len(races[0].get('runners', [])) > 0:
+                st.json(races[0]['runners'][0])
+            else:
+                st.write("No runner data found in this response.")
