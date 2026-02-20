@@ -32,28 +32,22 @@ def load_ledger():
             return conn.read(spreadsheet=GSHEET_URL, ttl=0)
         except:
             pass
-    return pd.DataFrame(columns=["Date", "Horse", "Course", "Odds", "Score", "Result", "P/L"])
+    return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Result", "P/L"])
 
-# --- 3. UPDATED FIX FOR YOUR ERROR ---
+# --- 3. DATA PROCESSING ---
 def get_best_odds(runner):
-    # Check for Starting Price first
     sp_val = runner.get('sp_dec')
     if sp_val and str(sp_val).replace('.','',1).isdigit():
         return float(sp_val)
     
     odds_list = runner.get('odds', [])
     prices = []
-    
     if isinstance(odds_list, list):
         for e in odds_list:
             val = e.get('decimal')
-            # Only try to convert if it's not None and not a dash/text
             if val is not None and str(val) not in ['-', 'SP', 'None', '']:
-                try:
-                    prices.append(float(val))
-                except (ValueError, TypeError):
-                    continue # Skip this specific price if it's invalid
-    
+                try: prices.append(float(val))
+                except: continue
     return max(prices) if prices else 0.0
 
 def get_score(h):
@@ -92,22 +86,33 @@ if st.button('🚀 Run Analysis'):
                             "Date": datetime.now().strftime("%Y-%m-%d"),
                             "Horse": r_data.get('horse'),
                             "Course": race.get('course'),
+                            "Time": race.get('off_time', race.get('off')),
                             "Odds": odds,
                             "Score": score,
                             "Result": "Pending",
                             "P/L": 0.0
                         })
 
+# DISPLAY TOP 3 GOLD CARDS
 if st.session_state.value_horses:
-    st.markdown("### 🏆 Top Daily Value Bets")
+    st.markdown("### 🏆 GOLD VALUE BETS")
     top_3 = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)[:3]
     cols = st.columns(3)
+    
     for i, h in enumerate(top_3):
         with cols[i]:
-            st.success(f"### {h['Horse']}\n**{int(h['Odds']-1) if h['Odds'] > 1 else 'SP'}/1** \nScore: {h['Score']}")
+            st.markdown(f"""
+            <div style="background-color:#FFD700; padding:20px; border-radius:10px; border:2px solid #DAA520; text-align:center; color:#000;">
+                <h2 style="margin:0; color:#000;">{h['Horse']}</h2>
+                <p style="margin:5px 0; font-size:16px;"><b>{h['Time']} - {h['Course']}</b></p>
+                <hr style="border-top: 1px solid #DAA520;">
+                <p style="font-size:20px; margin:5px;"><b>Score: {h['Score']}</b></p>
+                <p style="font-size:18px; margin:0;">Odds: {int(h['Odds']-1) if h['Odds'] > 1 else 'SP'}/1</p>
+            </div>
+            """, unsafe_allow_html=True)
 
-    st.markdown("---")
-    if st.button("📤 LOG ALL VALUE BETS TO GOOGLE SHEETS"):
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("📤 LOG ALL SELECTIONS TO GOOGLE SHEETS"):
         if conn:
             try:
                 ledger = load_ledger()
@@ -124,6 +129,7 @@ if st.session_state.value_horses:
             except Exception as e:
                 st.error(f"Logging Failed: {e}")
 
+# FULL RACE BREAKDOWN
 if st.session_state.all_races:
     for race in st.session_state.all_races:
         with st.expander(f"🕒 {race.get('off_time', race.get('off'))} - {race.get('course')}"):
