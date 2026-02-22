@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import requests
+import json
 from requests.auth import HTTPBasicAuth
 from datetime import datetime
 from streamlit_gsheets import GSheetsConnection
@@ -84,31 +85,48 @@ def reconcile_results():
                 st.sidebar.success(f"✅ Settled {match_count} bets!")
                 st.rerun()
         else:
-            st.sidebar.error(f"API Locked (Error {r.status_code}). Use Manual Settle below.")
+            st.sidebar.error(f"API Locked (Error {r.status_code}).")
     except Exception as e:
         st.sidebar.error(f"Request failed: {e}")
 
-# --- 4. MANUAL SETTLE TOOL ---
-def manual_settle():
+# --- 4. JSON UPLOAD TOOL ---
+def upload_json_data():
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🛠️ Manual Settle")
-    df = load_ledger()
-    pending_horses = df[df['Result'].str.strip().str.title() == 'Pending']['Horse'].tolist()
+    st.sidebar.subheader("📂 Restore from JSON")
+    uploaded_file = st.sidebar.file_uploader("Upload API JSON file", type=["json"])
     
-    if pending_horses:
-        selected_horse = st.sidebar.selectbox("Select Horse", pending_horses)
-        outcome = st.sidebar.radio("Outcome", ["Winner", "Loser"], horizontal=True)
-        if st.sidebar.button("Confirm Result"):
-            idx = df[df['Horse'] == selected_horse].index[0]
-            if outcome == "Winner":
-                df.at[idx, 'Result'] = 'Winner'
-                df.at[idx, 'P/L'] = float(df.at[idx, 'Odds']) - 1
+    if uploaded_file is not None:
+        try:
+            file_data = json.load(uploaded_file)
+            # Check if this is a Results JSON or a Selections JSON
+            raw_rows = []
+            
+            # If it's a Results JSON, we extract the winners
+            if 'results' in file_data:
+                for race in file_data['results']:
+                    for runner in race.get('runners', []):
+                        if str(runner.get('position')) == '1':
+                            raw_rows.append({
+                                "Date": race.get('date', datetime.now().strftime("%Y-%m-%d")),
+                                "Horse": runner.get('horse'),
+                                "Course": race.get('course'),
+                                "Result": "Winner",
+                                "Odds": runner.get('sp_dec', 0),
+                                "P/L": float(runner.get('sp_dec', 1)) - 1
+                            })
             else:
-                df.at[idx, 'Result'] = 'Loser'
-                df.at[idx, 'P/L'] = -1.0
-            conn.update(spreadsheet=GSHEET_URL, data=df)
-            st.sidebar.success(f"Settled {selected_horse}")
-            st.rerun()
+                # Assume it's a direct list of selections
+                raw_rows = file_data
+
+            new_df = pd.DataFrame(raw_rows)
+            if st.sidebar.button("🚀 Merge into Ledger"):
+                ledger_df = load_ledger()
+                updated_ledger = pd.concat([ledger_df, new_df], ignore_index=True).drop_duplicates(subset=['Horse', 'Date'], keep='first')
+                conn.update(spreadsheet=GSHEET_URL, data=updated_ledger)
+                st.sidebar.success("Ledger Updated!")
+                st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"JSON Error: {e}")
 
 # --- 5. PERFORMANCE DASHBOARD ---
 st.sidebar.header("📊 Performance Dashboard")
@@ -131,44 +149,40 @@ def display_sidebar_stats(s_val):
             c2.metric("ROI", f"{(total_money_pl / total_invested) * 100:.1f}%")
         
         st.sidebar.markdown("---")
-        if st.sidebar.button("🔄 Reconcile Yesterday's Bets"):
+        if st.sidebar.button("🔄 Reconcile Results"):
             reconcile_results()
         
-        manual_settle()
+        upload_json_data()
+    else:
+        st.sidebar.info("Ledger is empty.")
+        upload_json_data()
 
 display_sidebar_stats(stake_input)
 
-# --- 6. DATA PROCESSING (WITH FIXES) ---
+# --- 6. DATA PROCESSING ---
 def get_best_odds(runner):
     sp_val = runner.get('sp_dec')
     if sp_val and str(sp_val).replace('.','',1).isdigit(): return float(sp_val)
     prices = []
-    odds_data = runner.get('odds', [])
-    if isinstance(odds_data, list):
-        for e in odds_data:
+    odds_list = runner.get('odds', [])
+    if isinstance(odds_list, list):
+        for e in odds_list:
             val = str(e.get('decimal', '')).replace('.','',1)
-            if val.isdigit():
-                prices.append(float(e.get('decimal')))
+            if val.isdigit(): prices.append(float(e.get('decimal')))
     return max(prices) if prices else 0.0
 
 def get_score(h):
     s = 0
-    # Safety check for form
-    if str(h.get('form', '')).endswith('1'): 
-        s += 15
-    
-    # FIX: Robust safety check for Trainer Percentages
+    if str(h.get('form', '')).endswith('1'): s += 15
     t_stats = h.get('trainer_14_days', {})
     if isinstance(t_stats, dict):
-        raw_val = t_stats.get('percent', 0)
+        raw_pc = t_stats.get('percent', 0)
         try:
-            # Handle None or empty string values
-            if raw_val is not None and str(raw_val).strip() != "":
-                win_pc = float(raw_val)
+            if raw_pc is not None and str(raw_pc).strip() != "":
+                win_pc = float(raw_pc)
                 if win_pc > 20: s += 15
                 elif win_pc > 10: s += 5
-        except (ValueError, TypeError):
-            pass
+        except: pass
     return s
 
 # --- 7. MAIN INTERFACE ---
@@ -209,7 +223,6 @@ if st.session_state.value_horses:
             </div>
             """, unsafe_allow_html=True)
     
-    st.markdown("<br>", unsafe_allow_html=True)
     if st.button("📤 LOG ALL SELECTIONS TO GOOGLE SHEETS"):
         ledger = load_ledger()
         new_df = pd.DataFrame(st.session_state.value_horses)
