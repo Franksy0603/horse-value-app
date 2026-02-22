@@ -34,87 +34,90 @@ def load_ledger():
             pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "P/L"])
 
-# --- 3. ROBUST RECONCILE LOGIC ---
+# --- 3. ROBUST RECONCILE (DATE-SPECIFIC) ---
 def reconcile_results():
     df = load_ledger()
     if df.empty:
         st.sidebar.warning("Ledger is empty.")
         return
 
-    # Look for 'Pending' (case-insensitive and stripping whitespace)
+    # Check for 'Pending' rows
     pending_mask = df['Result'].str.strip().str.title() == 'Pending'
     pending_rows = df[pending_mask]
     
     if pending_rows.empty:
-        st.sidebar.info("No 'Pending' bets found to reconcile.")
+        st.sidebar.info("No 'Pending' bets found.")
         return
 
-    st.sidebar.info(f"🔄 Checking {len(pending_rows)} bets against results...")
+    # Get unique dates from pending bets to avoid 422 errors
+    unique_dates = pending_rows['Date'].unique()
+    
+    st.sidebar.info(f"🔄 Checking {len(pending_rows)} bets...")
     auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
-    
-    # Fetch latest results from the API
-    r = requests.get("https://api.theracingapi.com/v1/results/standard", auth=auth)
-    
-    if r.status_code == 200:
-        results_data = r.json().get('results', [])
-        
-        # Create a matching key of Course + Horse for every winner found in the API
-        winners_list = []
-        for race in results_data:
-            course_name = str(race.get('course', '')).upper().strip()
-            for runner in race.get('runners', []):
-                if str(runner.get('result')) == '1': # '1' indicates the winner
-                    horse_name = str(runner.get('horse', '')).upper().strip()
-                    winners_list.append(f"{course_name}|{horse_name}")
+    all_winners = []
 
-        match_count = 0
-        for index, row in df.iterrows():
-            if str(row['Result']).strip().title() == 'Pending':
-                c_name = str(row['Course']).upper().strip()
-                h_name = str(row['Horse']).upper().strip()
-                lookup_key = f"{c_name}|{h_name}"
-                
-                if lookup_key in winners_list:
-                    df.at[index, 'Result'] = 'Winner'
-                    df.at[index, 'P/L'] = float(row['Odds']) - 1
-                else:
-                    # Note: If checking Sunday for Saturday results, we assume not in winner list = loser
+    # Fetch results for the specific dates in the ledger
+    for date_str in unique_dates:
+        r = requests.get(f"https://api.theracingapi.com/v1/results/standard?date={date_str}", auth=auth)
+        if r.status_code == 200:
+            results_data = r.json().get('results', [])
+            for race in results_data:
+                course_name = str(race.get('course', '')).upper().strip()
+                for runner in race.get('runners', []):
+                    if str(runner.get('result')) == '1':
+                        horse_name = str(runner.get('horse', '')).upper().strip()
+                        all_winners.append(f"{course_name}|{horse_name}")
+        else:
+            st.sidebar.error(f"API Error for {date_str}: {r.status_code}")
+            return
+
+    match_count = 0
+    today = datetime.now().date()
+    
+    for index, row in df.iterrows():
+        if str(row['Result']).strip().title() == 'Pending':
+            c_name = str(row['Course']).upper().strip()
+            h_name = str(row['Horse']).upper().strip()
+            lookup_key = f"{c_name}|{h_name}"
+            
+            # Match horse against winners
+            if lookup_key in all_winners:
+                df.at[index, 'Result'] = 'Winner'
+                df.at[index, 'P/L'] = float(row['Odds']) - 1
+                match_count += 1
+            else:
+                # Only mark as loser if the race date has actually passed
+                race_date = datetime.strptime(str(row['Date']), "%Y-%m-%d").date()
+                if race_date < today:
                     df.at[index, 'Result'] = 'Loser'
                     df.at[index, 'P/L'] = -1.0
-                match_count += 1
+                    match_count += 1
         
-        if match_count > 0:
-            conn.update(spreadsheet=GSHEET_URL, data=df)
-            st.sidebar.success(f"✅ Settled {match_count} bets!")
-            st.rerun()
-        else:
-            st.sidebar.warning("API results for these races aren't available yet.")
+    if match_count > 0:
+        conn.update(spreadsheet=GSHEET_URL, data=df)
+        st.sidebar.success(f"✅ Settled {match_count} bets!")
+        st.rerun()
     else:
-        st.sidebar.error(f"API Error: {r.status_code}")
+        st.sidebar.warning("No matches found in API results yet.")
 
 # --- 4. SIDEBAR DASHBOARD ---
 st.sidebar.header("📊 Performance Dashboard")
-stake_input = st.sidebar.number_input("Current Stake (£)", min_value=1, value=10, step=1)
+stake_input = st.sidebar.number_input("Standard Stake (£)", min_value=1, value=10, step=1)
 
 def display_sidebar_stats(s_val):
     df = load_ledger()
     if not df.empty:
-        # Convert columns to numeric for calculation
+        # Ensure correct data types
         df['P/L'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
         df['Stake'] = pd.to_numeric(df['Stake'], errors='coerce').fillna(0)
         
-        # Calculate Money P/L (Each bet's P/L points * its specific stake)
+        # Calculate Money Metrics
         df['Money_PL'] = df['P/L'] * df['Stake']
         total_money_pl = df['Money_PL'].sum()
         total_invested = df['Stake'].sum()
         
-        # Filter for settled bets (non-pending)
-        settled_df = df[df['Result'].str.strip().str.title() != 'Pending']
-        total_bets = len(settled_df)
-        winners = len(df[df['Result'].str.strip().str.title() == 'Winner'])
-        
         pl_color = "green" if total_money_pl >= 0 else "red"
-        st.sidebar.markdown(f"### Total P/L: :{pl_color}[£{total_money_pl:,.2f}]")
+        st.sidebar.markdown(f"### Total Profit: :{pl_color}[£{total_money_pl:,.2f}]")
         
         c1, c2 = st.sidebar.columns(2)
         c1.metric("Invested", f"£{total_invested}")
@@ -189,6 +192,7 @@ if st.button('🚀 Run Analysis'):
                             "P/L": 0.0
                         })
 
+# SHOW TOP 3 GOLD CARDS
 if st.session_state.value_horses:
     st.markdown("### 🏆 GOLD VALUE BETS")
     top_3 = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)[:3]
@@ -211,7 +215,7 @@ if st.session_state.value_horses:
             try:
                 ledger = load_ledger()
                 new_df = pd.DataFrame(st.session_state.value_horses)
-                # Filter to avoid double-logging the same horse on the same day
+                # Verify column structure exists in new data
                 filtered = new_df[~new_df['Horse'].isin(ledger['Horse'])]
                 
                 if not filtered.empty:
