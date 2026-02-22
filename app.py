@@ -8,9 +8,9 @@ from datetime import datetime
 from streamlit_gsheets import GSheetsConnection
 
 st.set_page_config(page_title="Value Finder Pro", layout="wide")
-st.title("🏇 Value Finder Pro: Ledger Update")
+st.title("🏇 Value Finder Pro: Ledger & Results")
 
-# --- 1. SETTINGS & CONNECTION ---
+# --- 1. SETTINGS ---
 API_USER = st.secrets.get("API_USER", "")
 API_PASS = st.secrets.get("API_PASS", "")
 GSHEET_URL = st.secrets.get("gsheet_url", "")
@@ -19,7 +19,7 @@ try:
     conn = st.connection("gsheets", type=GSheetsConnection, ttl=0)
     st.sidebar.success("🔒 Ledger Connected")
 except:
-    st.sidebar.error("❌ GSheet Connection Failed")
+    st.sidebar.error("❌ Connection Error")
     conn = None
 
 def load_ledger():
@@ -29,83 +29,86 @@ def load_ledger():
         return df
     return pd.DataFrame()
 
-# --- 2. SIMPLE NAME CLEANER ---
+# --- 2. THE CLEANER ---
 def clean(text):
     if not text: return ""
-    # Just strip suffixes like (GB) and make Uppercase
-    return re.sub(r'\(.*?\)', '', str(text)).strip().upper()
+    # Remove (GB), (IRE) etc, remove non-letters, make uppercase
+    t = re.sub(r'\(.*?\)', '', str(text))
+    t = re.sub(r'[^A-Za-z0-9\s]', '', t)
+    return " ".join(t.split()).upper()
 
 # --- 3. THE RECONCILE ENGINE ---
-def reconcile_from_json(data):
-    # 1. Build a simple lookup of what happened
+def run_sync(data):
+    # Create the dictionary from JSON
     results_map = {}
     for race in data.get('results', []):
-        course = clean(race.get('course', ''))
+        c_name = clean(race.get('course', ''))
         for runner in race.get('runners', []):
-            horse = clean(runner.get('horse', ''))
-            pos = str(runner.get('position', ''))
-            # Key is COURSE|HORSE
-            results_map[f"{course}|{horse}"] = pos
+            h_name = clean(runner.get('horse', ''))
+            # Store the position as a string
+            results_map[f"{c_name}|{h_name}"] = str(runner.get('position', ''))
 
-    # 2. Update the Ledger
     df = load_ledger()
     if df.empty: return
-    
-    updated = 0
+
+    # Ensure 'Pos' and 'P/L' columns exist
+    if 'Pos' not in df.columns: df['Pos'] = "-"
+    if 'P/L' not in df.columns: df['P/L'] = 0.0
+
+    count = 0
     for i, row in df.iterrows():
-        # Only check horses marked as Pending
+        # Check for 'Pending' rows
         if str(row.get('Result', '')).strip().upper() == "PENDING":
-            c_key = clean(row.get('Course', ''))
-            h_key = clean(row.get('Horse', ''))
-            key = f"{c_key}|{h_key}"
+            key = f"{clean(row.get('Course'))}|{clean(row.get('Horse'))}"
             
             if key in results_map:
-                final_pos = results_map[key]
-                df.at[i, 'Pos'] = final_pos
-                # Determine Win/Loss
-                if final_pos == "1":
+                pos = results_map[key]
+                df.at[i, 'Pos'] = pos  # <--- HERE IS THE POSITION ADDITION
+                
+                if pos == "1":
                     df.at[i, 'Result'] = "Winner"
                     odds = pd.to_numeric(row.get('Odds', 1), errors='coerce') or 1
                     df.at[i, 'P/L'] = odds - 1
                 else:
                     df.at[i, 'Result'] = "Loser"
-                    df.at[index, 'P/L'] = -1.0
-                updated += 1
-    
-    if updated > 0:
+                    df.at[i, 'P/L'] = -1.0
+                count += 1
+
+    if count > 0:
         conn.update(spreadsheet=GSHEET_URL, data=df)
-        st.sidebar.success(f"✅ Updated {updated} horses!")
+        st.sidebar.success(f"✅ Updated {count} horses!")
         st.rerun()
     else:
-        st.sidebar.warning("No matches found. Ensure horse names in Sheet match the JSON.")
+        st.sidebar.warning("No matches found. Ensure horse names match exactly.")
 
-# --- 4. SIDEBAR DASHBOARD ---
-st.sidebar.header("📊 Performance")
-stake = st.sidebar.number_input("Standard Stake (£)", value=10)
+# --- 4. DASHBOARD SIDEBAR ---
+st.sidebar.header("📊 Performance Dashboard")
+stake_val = st.sidebar.number_input("Standard Stake (£)", value=10)
 
 df_stats = load_ledger()
 if not df_stats.empty and 'P/L' in df_stats.columns:
-    # ROI MATH
-    pl = pd.to_numeric(df_stats['P/L'], errors='coerce').fillna(0)
-    stk = pd.to_numeric(df_stats.get('Stake', stake), errors='coerce').fillna(stake)
-    total_profit = (pl * stk).sum()
-    total_invested = stk.sum()
-    roi = (total_profit / total_invested * 100) if total_invested > 0 else 0
+    # ROI & Profit Calculation
+    pl_col = pd.to_numeric(df_stats['P/L'], errors='coerce').fillna(0)
+    stk_col = pd.to_numeric(df_stats.get('Stake', stake_val), errors='coerce').fillna(stake_val)
     
-    color = "green" if total_profit >= 0 else "red"
-    st.sidebar.markdown(f"### Profit: :{color}[£{total_profit:,.2f}]")
-    st.sidebar.metric("Invested", f"£{total_invested:,.0f}")
+    total_prof = (pl_col * stk_col).sum()
+    total_inst = stk_col.sum()
+    roi = (total_prof / total_inst * 100) if total_inst > 0 else 0
+    
+    color = "green" if total_prof >= 0 else "red"
+    st.sidebar.markdown(f"### Total Profit: :{color}[£{total_prof:,.2f}]")
+    st.sidebar.metric("Invested", f"£{total_inst:,.0f}")
     st.sidebar.metric("ROI", f"{roi:.1f}%")
 
 st.sidebar.markdown("---")
-# SYNC TOOLS
-uploaded_file = st.sidebar.file_uploader("Upload Results JSON", type=["json"])
-if uploaded_file and st.sidebar.button("🚀 Sync Yesterday's Results"):
-    reconcile_from_json(json.load(uploaded_file))
+# UPLOAD TOOL
+up = st.sidebar.file_uploader("Upload JSON", type=["json"])
+if up and st.sidebar.button("🚀 Update Winners & Positions"):
+    run_sync(json.load(up))
 
-if st.sidebar.button("🔄 Auto Reconcile (Live)"):
+if st.sidebar.button("🔄 Auto Sync (Live)"):
     r = requests.get("https://api.theracingapi.com/v1/results/live", auth=HTTPBasicAuth(API_USER, API_PASS))
-    if r.status_code == 200: reconcile_from_json(r.json())
+    if r.status_code == 200: run_sync(r.json())
 
-# --- 5. RUN ANALYSIS (Original Logic) ---
-# ... (Analysis code here)
+# --- 5. ANALYSIS ENGINE (Your Original Logic) ---
+# ... [Original 'Run Analysis' code follows here]
