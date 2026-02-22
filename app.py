@@ -36,71 +36,62 @@ def load_ledger():
             pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "Pos", "P/L"])
 
-# --- 3. HELPER: FUZZY NAME CLEANER ---
+# --- 3. HELPER: AGGRESSIVE NAME CLEANER ---
 def clean_name(name):
     """Deep cleans names to ensure matches between Spreadsheet and API."""
     if not name: return ""
-    # 1. Remove country suffixes in parentheses: "Horse Name (IRE)" -> "Horse Name"
-    name = re.sub(r'\(.*?\)', '', str(name))
-    # 2. Remove non-alphanumeric chars (apostrophes, hyphens): "It's A Tie" -> "ITS A TIE"
-    name = re.sub(r'[^a-zA-Z0-9\s]', '', name)
-    # 3. Uppercase and strip extra whitespace
-    return name.strip().upper()
+    text = str(name).upper()
+    # Remove everything in parentheses: "(GB)", "(IRE)", "(AW)"
+    text = re.sub(r'\(.*?\)', '', text)
+    # Remove non-alphanumeric characters (apostrophes, hyphens, etc)
+    text = re.sub(r'[^A-Z0-9\s]', '', text)
+    # Collapse multiple spaces and strip
+    return " ".join(text.split())
 
-# --- 4. SMART JSON RESULT & POSITION MATCHER ---
-def upload_json_data():
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("📂 Smart Results Update")
-    uploaded_file = st.sidebar.file_uploader("Upload API Results JSON", type=["json"])
+# --- 4. DATA PROCESSING ENGINE ---
+def process_data_and_update(file_data):
+    all_positions = {} 
+    results_list = file_data.get('results', [])
     
-    if uploaded_file is not None:
-        try:
-            file_data = json.load(uploaded_file)
-            all_positions = {} 
+    # Map normalized names to positions from API data
+    for race in results_list:
+        course_name = clean_name(race.get('course', ''))
+        for runner in race.get('runners', []):
+            horse_name = clean_name(runner.get('horse', ''))
+            pos_val = runner.get('position')
+            if pos_val is not None:
+                all_positions[f"{course_name}|{horse_name}"] = str(pos_val)
 
-            results_list = file_data.get('results', [])
-            for race in results_list:
-                course_name = clean_name(race.get('course', ''))
-                for runner in race.get('runners', []):
-                    horse_name = clean_name(runner.get('horse', ''))
-                    pos_val = runner.get('position')
-                    if pos_val is not None:
-                        # Map normalized Course|Horse to the position
-                        all_positions[f"{course_name}|{horse_name}"] = str(pos_val)
-
-            if st.sidebar.button("🚀 Sync Positions & Results"):
-                df = load_ledger()
-                if 'Pos' not in df.columns: df['Pos'] = "-"
+    df = load_ledger()
+    if 'Pos' not in df.columns: df['Pos'] = "-"
+    
+    match_count = 0
+    for index, row in df.iterrows():
+        # Only update if the row is still 'Pending'
+        if str(row['Result']).strip().title() == 'Pending':
+            c_name = clean_name(row['Course'])
+            h_name = clean_name(row['Horse'])
+            lookup_key = f"{c_name}|{h_name}"
+            
+            if lookup_key in all_positions:
+                actual_pos = all_positions[lookup_key]
+                df.at[index, 'Pos'] = actual_pos
                 
-                match_count = 0
-                for index, row in df.iterrows():
-                    # We only update rows currently marked as 'Pending'
-                    if str(row['Result']).strip().title() == 'Pending':
-                        c_name = clean_name(row['Course'])
-                        h_name = clean_name(row['Horse'])
-                        lookup_key = f"{c_name}|{h_name}"
-                        
-                        if lookup_key in all_positions:
-                            actual_pos = all_positions[lookup_key]
-                            df.at[index, 'Pos'] = actual_pos
-                            
-                            if actual_pos == '1':
-                                df.at[index, 'Result'] = 'Winner'
-                                odds = pd.to_numeric(row['Odds'], errors='coerce') or 1.0
-                                df.at[index, 'P/L'] = odds - 1
-                            else:
-                                df.at[index, 'Result'] = 'Loser'
-                                df.at[index, 'P/L'] = -1.0
-                            match_count += 1
-                
-                if match_count > 0:
-                    conn.update(spreadsheet=GSHEET_URL, data=df)
-                    st.sidebar.success(f"✅ Successfully updated {match_count} bets!")
-                    st.rerun()
+                if actual_pos == '1':
+                    df.at[index, 'Result'] = 'Winner'
+                    odds = pd.to_numeric(row['Odds'], errors='coerce') or 1.0
+                    df.at[index, 'P/L'] = odds - 1
                 else:
-                    st.sidebar.warning("No matches found. Ensure the JSON covers the dates of your pending bets.")
-        except Exception as e:
-            st.sidebar.error(f"JSON Error: {e}")
+                    df.at[index, 'Result'] = 'Loser'
+                    df.at[index, 'P/L'] = -1.0
+                match_count += 1
+    
+    if match_count > 0:
+        conn.update(spreadsheet=GSHEET_URL, data=df)
+        st.sidebar.success(f"✅ Successfully updated {match_count} bets!")
+        st.rerun()
+    else:
+        st.sidebar.warning("No matches found. Ensure the names in your sheet align with the JSON.")
 
 # --- 5. PERFORMANCE DASHBOARD ---
 st.sidebar.header("📊 Performance Dashboard")
@@ -122,10 +113,33 @@ def display_sidebar_stats(s_val):
         if total_invested > 0:
             c2.metric("ROI", f"{(total_money_pl / total_invested) * 100:.1f}%")
         
-        upload_json_data()
+        st.sidebar.markdown("---")
+        # RESTORED AUTO RECONCILE
+        if st.sidebar.button("🔄 Auto Reconcile (Live API)"):
+            st.sidebar.info("Fetching live results...")
+            auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
+            try:
+                r = requests.get("https://api.theracingapi.com/v1/results/live", auth=auth, timeout=10)
+                if r.status_code == 200:
+                    process_data_and_update(r.json())
+                elif r.status_code == 422:
+                    st.sidebar.error("API Error 422: Data is currently locked/processing. Use Manual JSON.")
+                else:
+                    st.sidebar.error(f"API Error {r.status_code}. Try again later.")
+            except Exception as e:
+                st.sidebar.error(f"Sync failed: {e}")
+
+        # MANUAL JSON UPLOADER
+        st.sidebar.subheader("📂 Manual JSON Update")
+        uploaded_file = st.sidebar.file_uploader("Upload API Results JSON", type=["json"])
+        if uploaded_file:
+            if st.sidebar.button("🚀 Sync from File"):
+                try:
+                    process_data_and_update(json.load(uploaded_file))
+                except Exception as e:
+                    st.sidebar.error(f"File Error: {e}")
     else:
         st.sidebar.info("Ledger is empty.")
-        upload_json_data()
 
 display_sidebar_stats(stake_input)
 
@@ -183,7 +197,6 @@ if st.session_state.value_horses:
         ledger = load_ledger()
         new_df = pd.DataFrame(st.session_state.value_horses)
         today_str = datetime.now().strftime("%Y-%m-%d")
-        # Only log if not already there today
         filtered = new_df[~new_df['Horse'].isin(ledger[ledger['Date'] == today_str]['Horse'])]
         if not filtered.empty:
             conn.update(spreadsheet=GSHEET_URL, data=pd.concat([ledger, filtered], ignore_index=True))
