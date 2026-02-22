@@ -29,62 +29,60 @@ except Exception as e:
     conn = None
 
 def load_ledger():
-    """Loads ledger and forces all names/types to be safe."""
+    """Loads ledger with defensive checks for every column."""
     if conn and GSHEET_URL:
         try:
             df = conn.read(spreadsheet=GSHEET_URL, ttl=0)
             if df is not None:
-                # Remove extra spaces from headers
+                # 1. Clean column headers (remove spaces)
                 df.columns = [str(c).strip() for c in df.columns]
-                # Convert P/L and Stake to numbers immediately, or 0 if they fail
-                if 'P/L' in df.columns:
-                    df['P/L'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0.0)
-                if 'Stake' in df.columns:
-                    df['Stake'] = pd.to_numeric(df['Stake'], errors='coerce').fillna(0.0)
+                
+                # 2. Force essential columns to exist so the math doesn't crash
+                for col in ["P/L", "Stake", "Result", "Horse", "Course", "Odds"]:
+                    if col not in df.columns:
+                        df[col] = 0.0 if col in ["P/L", "Stake"] else "-"
+                
+                # 3. Force numeric types
+                df["P/L"] = pd.to_numeric(df["P/L"], errors="coerce").fillna(0.0)
+                df["Stake"] = pd.to_numeric(df["Stake"], errors="coerce").fillna(0.0)
+                df["Odds"] = pd.to_numeric(df["Odds"], errors="coerce").fillna(1.0)
                 return df
         except Exception as e:
-            st.error(f"Spreadsheet Error: {e}")
+            st.error(f"⚠️ Spreadsheet Read Error: {e}")
     return pd.DataFrame()
 
-# --- 3. RECONCILE LOGIC (Aggressive Name Cleaning) ---
+# --- 3. RECONCILE LOGIC (Enhanced Precision) ---
 def clean_txt(text):
-    if text is None: return ""
-    # Remove bracketed info (AW), (IRE), etc.
+    if not text: return ""
+    # Remove bracketed text, non-alphanumeric, then uppercase
     text = re.sub(r'\(.*?\)', '', str(text))
-    # Remove everything except letters and numbers
     text = re.sub(r'[^A-Za-z0-9\s]', '', text)
-    # Upper case and remove double spaces
     return " ".join(text.split()).upper().strip()
 
 def process_reconciliation(data):
-    """Matches API results to the Ledger without date-dependency."""
+    """Processes results and forces updates even if formatting is off."""
     try:
         results_map = {}
-        api_log = []
+        api_keys_seen = []
         
         for race in data.get('results', []):
-            course_name = clean_txt(race.get('course', ''))
+            course = clean_txt(race.get('course', ''))
             for runner in race.get('runners', []):
-                horse_name = clean_txt(runner.get('horse', ''))
+                horse = clean_txt(runner.get('horse', ''))
                 pos = str(runner.get('position', ''))
-                key = f"{course_name}|{horse_name}"
+                key = f"{course}|{horse}"
                 results_map[key] = pos
-                api_log.append(key)
+                api_keys_seen.append(key)
 
         df = load_ledger()
         if df.empty: return
 
-        # Ensure settlement columns exist
-        for col in ['Pos', 'Result', 'P/L']:
-            if col not in df.columns: df[col] = "-"
-
         match_count = 0
-        missed = []
+        mismatch_log = []
 
         for i, row in df.iterrows():
-            # Check if Result is 'Pending' regardless of case
-            res_val = str(row.get('Result', '')).strip().upper()
-            if res_val == 'PENDING' or res_val == '-':
+            # Check for 'Pending' status (case insensitive)
+            if str(row.get('Result', '')).strip().upper() in ['PENDING', '-']:
                 lookup_key = f"{clean_txt(row.get('Course'))}|{clean_txt(row.get('Horse'))}"
                 
                 if lookup_key in results_map:
@@ -92,68 +90,65 @@ def process_reconciliation(data):
                     df.at[i, 'Pos'] = final_pos
                     if final_pos == '1':
                         df.at[i, 'Result'] = 'Winner'
-                        odds = pd.to_numeric(row.get('Odds', 1), errors='coerce') or 1.0
-                        df.at[i, 'P/L'] = float(odds) - 1.0
+                        df.at[i, 'P/L'] = float(row.get('Odds', 1)) - 1.0
                     else:
                         df.at[i, 'Result'] = 'Loser'
                         df.at[i, 'P/L'] = -1.0
                     match_count += 1
                 else:
-                    missed.append(lookup_key)
+                    mismatch_log.append(lookup_key)
 
         if match_count > 0:
             conn.update(spreadsheet=GSHEET_URL, data=df)
-            st.success(f"Successfully settled {match_count} bets!")
+            st.success(f"✅ Successfully settled {match_count} bets!")
             st.rerun()
         else:
-            st.warning("No matches found between Ledger and API.")
-            with st.expander("🔍 Detailed Matching Log"):
-                st.write("**Looking for these (from your Sheet):**")
-                st.write(missed[:10])
-                st.write("**Found these (from API):**")
-                st.write(api_log[:10])
+            with st.expander("🔍 Reconciliation Diagnostic"):
+                st.info("No matches found. Check if names match exactly.")
+                st.write("**Your Ledger Keys:**", mismatch_log[:10])
+                st.write("**API Result Keys:**", api_keys_seen[:10])
 
     except Exception as e:
         st.error(f"Reconciliation crashed: {e}")
 
 # --- 4. SIDEBAR DASHBOARD ---
 st.sidebar.header("📊 Performance Dashboard")
-stake_input = st.sidebar.number_input("Standard Stake (£)", min_value=1, value=10, step=1)
+stake_val = st.sidebar.number_input("Standard Stake (£)", min_value=1, value=10)
 
-def display_sidebar_stats(s_val):
+def display_sidebar_stats():
     try:
         df = load_ledger()
         if not df.empty:
-            # Safe math
-            profit = (df['P/L'] * df['Stake']).sum()
-            invested = df['Stake'].sum()
+            # Shielded calculation to prevent crashing on empty/bad rows
+            total_profit = (df['P/L'] * df['Stake']).sum()
+            total_invested = df['Stake'].sum()
             
-            color = "green" if profit >= 0 else "red"
-            st.sidebar.markdown(f"### Profit: :{color}[£{profit:,.2f}]")
+            pl_color = "green" if total_profit >= 0 else "red"
+            st.sidebar.markdown(f"### Profit: :{pl_color}[£{total_profit:,.2f}]")
             
             c1, c2 = st.sidebar.columns(2)
-            c1.metric("Invested", f"£{invested:,.0f}")
-            roi = (profit / invested * 100) if invested > 0 else 0
+            c1.metric("Invested", f"£{total_invested:,.0f}")
+            roi = (total_profit / total_invested * 100) if total_invested > 0 else 0
             c2.metric("ROI", f"{roi:.1f}%")
             
             st.sidebar.markdown("---")
             st.sidebar.subheader("🔄 Reconcile")
             
-            if st.sidebar.button("🔄 Auto-Sync (Last 2 Days)"):
+            if st.sidebar.button("🔄 Auto-Sync (Standard API)"):
                 auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
-                all_results = {"results": []}
-                for d in [0, 1]:
-                    dt = (datetime.now() - timedelta(days=d)).strftime("%Y-%m-%d")
-                    r = requests.get(f"https://api.theracingapi.com/v1/results/standard?date={dt}", auth=auth)
+                all_res = {"results": []}
+                for day in [0, 1]:
+                    d_str = (datetime.now() - timedelta(days=day)).strftime("%Y-%m-%d")
+                    r = requests.get(f"https://api.theracingapi.com/v1/results/standard?date={d_str}", auth=auth)
                     if r.status_code == 200:
-                        all_results["results"].extend(r.json().get('results', []))
-                process_reconciliation(all_results)
+                        all_res["results"].extend(r.json().get('results', []))
+                process_reconciliation(all_res)
     except Exception as e:
-        st.sidebar.error("Stats Error: Check Sheet Columns")
+        st.sidebar.error(f"Stats Error: {e}")
 
-display_sidebar_stats(stake_input)
+display_sidebar_stats()
 
-# --- 5 & 6. SCORING & INTERFACE (Consolidated) ---
+# --- 5. SCORING ENGINE ---
 def get_best_odds(runner):
     sp = runner.get('sp_dec')
     if sp and str(sp).replace('.','',1).isdigit(): return float(sp)
@@ -170,48 +165,47 @@ def get_score(h):
     except: pass
     return s
 
+# --- 6. MAIN INTERFACE ---
 if st.button('🚀 Run Analysis'):
-    with st.spinner("Analyzing..."):
+    with st.spinner("Finding value..."):
         auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
         r = requests.get("https://api.theracingapi.com/v1/racecards/standard", auth=auth)
         if r.status_code == 200:
             st.session_state.all_races = r.json().get('racecards', [])
             st.session_state.value_horses = []
             for race in st.session_state.all_races:
-                for runner in race.get('runners', []):
-                    odds = get_best_odds(runner)
-                    score = get_score(runner)
+                for r_data in race.get('runners', []):
+                    odds, score = get_best_odds(r_data), get_score(r_data)
                     if score >= 20 and odds >= 5.0:
                         st.session_state.value_horses.append({
                             "Date": datetime.now().strftime("%Y-%m-%d"),
-                            "Horse": runner.get('horse'),
+                            "Horse": r_data.get('horse'),
                             "Course": race.get('course'),
                             "Time": race.get('off_time', race.get('off')),
-                            "Odds": odds, "Score": score, "Stake": stake_input,
+                            "Odds": odds, "Score": score, "Stake": stake_val,
                             "Result": "Pending", "Pos": "-", "P/L": 0.0
                         })
 
 if st.session_state.value_horses:
-    st.markdown("### 🏆 Top Selections")
+    st.markdown("### 🏆 Gold Bets")
     cols = st.columns(min(3, len(st.session_state.value_horses)))
     for i, h in enumerate(st.session_state.value_horses[:3]):
-        with cols[i]:
-            st.success(f"**{h['Horse']}**\n\n{h['Time']} {h['Course']}\n\nScore: {h['Score']}")
-
-    if st.button("📤 Log to Ledger"):
+        cols[i].success(f"**{h['Horse']}**\n\n{h['Time']} {h['Course']}\n\nScore: {h['Score']}")
+    
+    if st.button("📤 Log Selections"):
         ledger = load_ledger()
-        new_data = pd.DataFrame(st.session_state.value_horses)
+        new_df = pd.DataFrame(st.session_state.value_horses)
         if not ledger.empty:
-            new_data = new_data[~new_data['Horse'].isin(ledger['Horse'])]
-        combined = pd.concat([ledger, new_data], ignore_index=True)
-        conn.update(spreadsheet=GSHEET_URL, data=combined)
+            new_df = new_df[~new_df['Horse'].isin(ledger['Horse'])]
+        updated = pd.concat([ledger, new_df], ignore_index=True)
+        conn.update(spreadsheet=GSHEET_URL, data=updated)
         st.success("Logged!")
         st.rerun()
 
 if st.session_state.all_races:
     for race in st.session_state.all_races:
         with st.expander(f"🕒 {race.get('course')} - {race.get('off_time', 'Race')}"):
-            st.write(pd.DataFrame([{
+            st.table(pd.DataFrame([{
                 "Horse": r.get('horse'), "Score": get_score(r),
                 "Odds": f"{int(get_best_odds(r)-1)}/1" if get_best_odds(r) > 1 else "SP"
             } for r in race.get('runners', [])]))
