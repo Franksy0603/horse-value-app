@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import requests
+import json
+import re
 from requests.auth import HTTPBasicAuth
 from datetime import datetime
 from streamlit_gsheets import GSheetsConnection
@@ -29,83 +31,57 @@ except Exception as e:
 def load_ledger():
     if conn and GSHEET_URL:
         try:
-            return conn.read(spreadsheet=GSHEET_URL, ttl=0)
-        except:
-            pass
-    return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "P/L"])
+            df = conn.read(spreadsheet=GSHEET_URL, ttl=0)
+            df.columns = [str(c).strip() for c in df.columns]
+            return df
+        except: pass
+    return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "Pos", "P/L"])
 
-# --- 3. UPDATED RECONCILE (MATCHED TO API DATA) ---
-def reconcile_results():
+# --- 3. RECONCILE LOGIC (Manual & Auto) ---
+def clean_txt(text):
+    if not text: return ""
+    return re.sub(r'\(.*?\)', '', str(text)).strip().upper()
+
+def process_reconciliation(data):
+    """Processes JSON data (from API or Upload) to update the ledger."""
+    results_map = {}
+    for race in data.get('results', []):
+        course = clean_txt(race.get('course', ''))
+        for runner in race.get('runners', []):
+            horse = clean_txt(runner.get('horse', ''))
+            pos = str(runner.get('position', ''))
+            results_map[f"{course}|{horse}"] = pos
+
     df = load_ledger()
-    if df.empty:
-        st.sidebar.warning("Ledger is empty.")
-        return
+    if df.empty: return
 
-    # Look for 'Pending' rows
-    pending_mask = df['Result'].str.strip().str.title() == 'Pending'
-    pending_rows = df[pending_mask]
-    
-    if pending_rows.empty:
-        st.sidebar.info("No 'Pending' bets found.")
-        return
-
-    # Get unique dates from pending bets
-    unique_dates = pending_rows['Date'].unique()
-    
-    st.sidebar.info(f"🔄 Checking {len(pending_rows)} bets...")
-    auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
-    all_winners = []
-
-    # Fetch results for the specific dates in the ledger
-    for date_str in unique_dates:
-        r = requests.get(f"https://api.theracingapi.com/v1/results/standard?date={date_str}", auth=auth)
-        
-        if r.status_code == 200:
-            results_data = r.json().get('results', [])
-            for race in results_data:
-                # API uses mixed case; Ledger uses Upper. We standardize to Upper.
-                course_name = str(race.get('course', '')).upper().strip()
-                for runner in race.get('runners', []):
-                    # DATA FIX: Use 'position' field instead of 'result'
-                    if str(runner.get('position')) == '1':
-                        horse_name = str(runner.get('horse', '')).upper().strip()
-                        all_winners.append(f"{course_name}|{horse_name}")
-        elif r.status_code == 422:
-            st.sidebar.warning(f"⚠️ Results for {date_str} are still processing in the API.")
-            return 
-        else:
-            st.sidebar.error(f"API Error {r.status_code} for {date_str}")
-            return
-
-    if not all_winners:
-        st.sidebar.info("Waiting for winners to be published to the API results...")
-        return
+    # Ensure columns exist
+    for col in ['Pos', 'Result', 'P/L']:
+        if col not in df.columns: df[col] = "-"
 
     match_count = 0
-    today = datetime.now().date()
-    
-    for index, row in df.iterrows():
-        if str(row['Result']).strip().title() == 'Pending':
-            c_name = str(row['Course']).upper().strip()
-            h_name = str(row['Horse']).upper().strip()
-            lookup_key = f"{c_name}|{h_name}"
+    for i, row in df.iterrows():
+        if str(row.get('Result', '')).strip().title() == 'Pending':
+            key = f"{clean_txt(row.get('Course'))}|{clean_txt(row.get('Horse'))}"
             
-            if lookup_key in all_winners:
-                df.at[index, 'Result'] = 'Winner'
-                df.at[index, 'P/L'] = float(row['Odds']) - 1
+            if key in results_map:
+                final_pos = results_map[key]
+                df.at[i, 'Pos'] = final_pos
+                if final_pos == '1':
+                    df.at[i, 'Result'] = 'Winner'
+                    odds = pd.to_numeric(row.get('Odds', 1), errors='coerce') or 1
+                    df.at[i, 'P/L'] = odds - 1
+                else:
+                    df.at[i, 'Result'] = 'Loser'
+                    df.at[i, 'P/L'] = -1.0
                 match_count += 1
-            else:
-                # Mark as loser only if race date is in the past
-                race_date = datetime.strptime(str(row['Date']), "%Y-%m-%d").date()
-                if race_date < today:
-                    df.at[index, 'Result'] = 'Loser'
-                    df.at[index, 'P/L'] = -1.0
-                    match_count += 1
-        
+
     if match_count > 0:
         conn.update(spreadsheet=GSHEET_URL, data=df)
         st.sidebar.success(f"✅ Settled {match_count} bets!")
         st.rerun()
+    else:
+        st.sidebar.warning("No matches found for Pending bets.")
 
 # --- 4. SIDEBAR DASHBOARD ---
 st.sidebar.header("📊 Performance Dashboard")
@@ -114,48 +90,50 @@ stake_input = st.sidebar.number_input("Standard Stake (£)", min_value=1, value=
 def display_sidebar_stats(s_val):
     df = load_ledger()
     if not df.empty:
-        # Check if 'Stake' exists; if not, create it
-        if 'Stake' not in df.columns:
-            df['Stake'] = s_val
-            
+        if 'Stake' not in df.columns: df['Stake'] = s_val
         df['P/L'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
         df['Stake'] = pd.to_numeric(df['Stake'], errors='coerce').fillna(0)
         
-        # Calculate Money Metrics
-        df['Money_PL'] = df['P/L'] * df['Stake']
-        total_money_pl = df['Money_PL'].sum()
+        total_profit = (df['P/L'] * df['Stake']).sum()
         total_invested = df['Stake'].sum()
         
-        pl_color = "green" if total_money_pl >= 0 else "red"
-        st.sidebar.markdown(f"### Total Profit: :{pl_color}[£{total_money_pl:,.2f}]")
+        pl_color = "green" if total_profit >= 0 else "red"
+        st.sidebar.markdown(f"### Total Profit: :{pl_color}[£{total_profit:,.2f}]")
         
         c1, c2 = st.sidebar.columns(2)
         c1.metric("Invested", f"£{total_invested}")
         if total_invested > 0:
-            roi = (total_money_pl / total_invested) * 100
+            roi = (total_profit / total_invested) * 100
             c2.metric("ROI", f"{roi:.1f}%")
         
         st.sidebar.markdown("---")
-        if st.sidebar.button("🔄 Reconcile Yesterday's Bets"):
-            reconcile_results()
+        st.sidebar.subheader("🔄 Reconcile Results")
+        
+        # --- NEW: MANUAL JSON UPLOAD ---
+        uploaded_file = st.sidebar.file_uploader("Upload Results JSON", type=["json"])
+        if uploaded_file and st.sidebar.button("🚀 Sync Uploaded File"):
+            process_reconciliation(json.load(uploaded_file))
+        
+        st.sidebar.markdown("OR")
+        
+        if st.sidebar.button("🔄 Auto Reconcile (Live API)"):
+            auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
+            r = requests.get("https://api.theracingapi.com/v1/results/live", auth=auth)
+            if r.status_code == 200:
+                process_reconciliation(r.json())
+            else:
+                st.sidebar.error("API currently unavailable")
     else:
         st.sidebar.info("Ledger is empty.")
 
 display_sidebar_stats(stake_input)
 
-# --- 5. DATA PROCESSING ---
+# --- 5. SCORING ENGINE ---
 def get_best_odds(runner):
     sp_val = runner.get('sp_dec')
-    if sp_val and str(sp_val).replace('.','',1).isdigit():
-        return float(sp_val)
+    if sp_val and str(sp_val).replace('.','',1).isdigit(): return float(sp_val)
     odds_list = runner.get('odds', [])
-    prices = []
-    if isinstance(odds_list, list):
-        for e in odds_list:
-            val = e.get('decimal')
-            if val is not None and str(val) not in ['-', 'SP', 'None', '']:
-                try: prices.append(float(val))
-                except: continue
+    prices = [float(e.get('decimal')) for e in odds_list if e.get('decimal') not in ['-', 'SP', '', None]]
     return max(prices) if prices else 0.0
 
 def get_score(h):
@@ -180,11 +158,11 @@ if st.button('🚀 Run Analysis'):
     with st.spinner("Analyzing today's value..."):
         auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
         r = requests.get("https://api.theracingapi.com/v1/racecards/standard", auth=auth)
-        races = r.json().get('racecards', [])
-        st.session_state.all_races = races
-        st.session_state.value_horses = []
-        
-        if races:
+        if r.status_code == 200:
+            races = r.json().get('racecards', [])
+            st.session_state.all_races = races
+            st.session_state.value_horses = []
+            
             for race in races:
                 for r_data in race.get('runners', []):
                     odds = get_best_odds(r_data)
@@ -199,6 +177,7 @@ if st.button('🚀 Run Analysis'):
                             "Score": score,
                             "Stake": stake_input,
                             "Result": "Pending",
+                            "Pos": "-",
                             "P/L": 0.0
                         })
 
@@ -222,20 +201,15 @@ if st.session_state.value_horses:
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("📤 LOG ALL SELECTIONS TO GOOGLE SHEETS"):
         if conn:
-            try:
-                ledger = load_ledger()
-                new_df = pd.DataFrame(st.session_state.value_horses)
-                filtered = new_df[~new_df['Horse'].isin(ledger['Horse'])]
-                if not filtered.empty:
-                    updated_df = pd.concat([ledger, filtered], ignore_index=True)
-                    conn.update(spreadsheet=GSHEET_URL, data=updated_df)
-                    st.balloons()
-                    st.success(f"Successfully logged {len(filtered)} bets!")
-                    st.rerun()
-                else:
-                    st.info("Today's horses are already in the ledger.")
-            except Exception as e:
-                st.error(f"Logging Failed: {e}")
+            ledger = load_ledger()
+            new_df = pd.DataFrame(st.session_state.value_horses)
+            filtered = new_df[~new_df['Horse'].isin(ledger['Horse'])]
+            if not filtered.empty:
+                updated_df = pd.concat([ledger, filtered], ignore_index=True)
+                conn.update(spreadsheet=GSHEET_URL, data=updated_df)
+                st.balloons()
+                st.success(f"Successfully logged {len(filtered)} bets!")
+                st.rerun()
 
 if st.session_state.all_races:
     for race in st.session_state.all_races:
