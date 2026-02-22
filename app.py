@@ -41,7 +41,7 @@ def reconcile_results():
         st.sidebar.warning("Ledger is empty.")
         return
 
-    # Filter for Pending bets
+    # Check for 'Pending' rows
     pending_mask = df['Result'].str.strip().str.title() == 'Pending'
     pending_rows = df[pending_mask]
     
@@ -53,7 +53,7 @@ def reconcile_results():
     auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
     all_winners = []
 
-    # Use /live endpoint to bypass the 422 Archive error
+    # Using /live endpoint to bypass the 422 Archive lag
     r = requests.get("https://api.theracingapi.com/v1/results/live", auth=auth)
     
     if r.status_code == 200:
@@ -61,7 +61,7 @@ def reconcile_results():
         for race in results_data:
             course_name = str(race.get('course', '')).upper().strip()
             for runner in race.get('runners', []):
-                # Using 'position' as confirmed by your JSON file
+                # Using 'position' as confirmed by your JSON download
                 if str(runner.get('position')) == '1':
                     horse_name = str(runner.get('horse', '')).upper().strip()
                     all_winners.append(f"{course_name}|{horse_name}")
@@ -83,7 +83,7 @@ def reconcile_results():
                 df.at[index, 'P/L'] = float(row['Odds']) - 1
                 match_count += 1
             else:
-                # Mark as Loser only if the race date is in the past
+                # Mark as loser only if the race date is in the past
                 try:
                     race_date = datetime.strptime(str(row['Date']), "%Y-%m-%d").date()
                     if race_date < today:
@@ -195,27 +195,39 @@ if st.session_state.value_horses:
     for i, h in enumerate(top_3):
         with cols[i]:
             st.markdown(f"""
-            <div style="background-color:#FFD700; padding:10px; border-radius:10px; text-align:center; color:#000;">
-                <h2 style="margin:0;">{h['Horse']}</h2>
-                <p><b>{h['Time']} - {h['Course']}</b></p>
-                <p>Score: {h['Score']}</p>
-                <p>Odds: {h['Odds']}</p>
+            <div style="background-color:#FFD700; padding:20px; border-radius:10px; border:2px solid #DAA520; text-align:center; color:#000;">
+                <h2 style="margin:0; color:#000;">{h['Horse']}</h2>
+                <p style="margin:5px 0; font-size:16px;"><b>{h['Time']} - {h['Course']}</b></p>
+                <hr style="border-top: 1px solid #DAA520;">
+                <p style="font-size:20px; margin:5px;"><b>Score: {h['Score']}</b></p>
+                <p style="font-size:18px; margin:0;">Odds: {int(h['Odds']-1) if h['Odds'] > 1 else 'SP'}/1</p>
             </div>
             """, unsafe_allow_html=True)
 
-    if st.button("📤 LOG ALL SELECTIONS"):
-        ledger = load_ledger()
-        new_df = pd.DataFrame(st.session_state.value_horses)
-        updated_df = pd.concat([ledger, new_df], ignore_index=True)
-        conn.update(spreadsheet=GSHEET_URL, data=updated_df)
-        st.success("Log Updated!")
-        st.rerun()
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("📤 LOG ALL SELECTIONS TO GOOGLE SHEETS"):
+        if conn:
+            try:
+                ledger = load_ledger()
+                new_df = pd.DataFrame(st.session_state.value_horses)
+                filtered = new_df[~new_df['Horse'].isin(ledger['Horse'])]
+                if not filtered.empty:
+                    updated_df = pd.concat([ledger, filtered], ignore_index=True)
+                    conn.update(spreadsheet=GSHEET_URL, data=updated_df)
+                    st.balloons()
+                    st.success(f"Successfully logged {len(filtered)} bets!")
+                    st.rerun()
+                else:
+                    st.info("Today's horses are already in the ledger.")
+            except Exception as e:
+                st.error(f"Logging Failed: {e}")
 
 if st.session_state.all_races:
     for race in st.session_state.all_races:
-        with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')}"):
+        with st.expander(f"🕒 {race.get('off_time', race.get('off'))} - {race.get('course')}"):
             st.table(pd.DataFrame([{
                 "Horse": r.get('horse'),
                 "Score": get_score(r),
-                "Odds": get_best_odds(r)
+                "Odds": f"{int(get_best_odds(r)-1)}/1" if get_best_odds(r) > 1 else "SP",
+                "Value": "💎 YES" if (get_score(r) >= min_score and get_best_odds(r) >= 5.0) else ""
             } for r in race.get('runners', [])]))
