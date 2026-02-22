@@ -34,14 +34,13 @@ def load_ledger():
             pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "P/L"])
 
-# --- 3. UPDATED RECONCILE (MATCHED TO API DATA) ---
+# --- 3. RECONCILE (LIVE FEED METHOD) ---
 def reconcile_results():
     df = load_ledger()
     if df.empty:
         st.sidebar.warning("Ledger is empty.")
         return
 
-    # Look for 'Pending' rows
     pending_mask = df['Result'].str.strip().str.title() == 'Pending'
     pending_rows = df[pending_mask]
     
@@ -49,36 +48,28 @@ def reconcile_results():
         st.sidebar.info("No 'Pending' bets found.")
         return
 
-    # Get unique dates from pending bets
-    unique_dates = pending_rows['Date'].unique()
-    
-    st.sidebar.info(f"🔄 Checking {len(pending_rows)} bets...")
+    st.sidebar.info(f"🔄 Fetching Live Results...")
     auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
     all_winners = []
 
-    # Fetch results for the specific dates in the ledger
-    for date_str in unique_dates:
-        r = requests.get(f"https://api.theracingapi.com/v1/results/standard?date={date_str}", auth=auth)
-        
-        if r.status_code == 200:
-            results_data = r.json().get('results', [])
-            for race in results_data:
-                # API uses mixed case; Ledger uses Upper. We standardize to Upper.
-                course_name = str(race.get('course', '')).upper().strip()
-                for runner in race.get('runners', []):
-                    # DATA FIX: Use 'position' field instead of 'result'
-                    if str(runner.get('position')) == '1':
-                        horse_name = str(runner.get('horse', '')).upper().strip()
-                        all_winners.append(f"{course_name}|{horse_name}")
-        elif r.status_code == 422:
-            st.sidebar.warning(f"⚠️ Results for {date_str} are still processing in the API.")
-            return 
-        else:
-            st.sidebar.error(f"API Error {r.status_code} for {date_str}")
-            return
+    # Bypassing the 422 Archive error by using the Live Feed
+    r = requests.get("https://api.theracingapi.com/v1/results/live", auth=auth)
+    
+    if r.status_code == 200:
+        results_data = r.json().get('results', [])
+        for race in results_data:
+            course_name = str(race.get('course', '')).upper().strip()
+            for runner in race.get('runners', []):
+                # Using 'position' as confirmed by your JSON file
+                if str(runner.get('position')) == '1':
+                    horse_name = str(runner.get('horse', '')).upper().strip()
+                    all_winners.append(f"{course_name}|{horse_name}")
+    else:
+        st.sidebar.error(f"Live API unavailable (Error {r.status_code}).")
+        return
 
     if not all_winners:
-        st.sidebar.info("Waiting for winners to be published to the API results...")
+        st.sidebar.warning("No winners found in the live feed yet.")
         return
 
     match_count = 0
@@ -95,12 +86,14 @@ def reconcile_results():
                 df.at[index, 'P/L'] = float(row['Odds']) - 1
                 match_count += 1
             else:
-                # Mark as loser only if race date is in the past
-                race_date = datetime.strptime(str(row['Date']), "%Y-%m-%d").date()
-                if race_date < today:
-                    df.at[index, 'Result'] = 'Loser'
-                    df.at[index, 'P/L'] = -1.0
-                    match_count += 1
+                try:
+                    race_date = datetime.strptime(str(row['Date']), "%Y-%m-%d").date()
+                    if race_date < today:
+                        df.at[index, 'Result'] = 'Loser'
+                        df.at[index, 'P/L'] = -1.0
+                        match_count += 1
+                except:
+                    continue
         
     if match_count > 0:
         conn.update(spreadsheet=GSHEET_URL, data=df)
@@ -114,14 +107,12 @@ stake_input = st.sidebar.number_input("Standard Stake (£)", min_value=1, value=
 def display_sidebar_stats(s_val):
     df = load_ledger()
     if not df.empty:
-        # Check if 'Stake' exists; if not, create it
         if 'Stake' not in df.columns:
             df['Stake'] = s_val
             
         df['P/L'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
         df['Stake'] = pd.to_numeric(df['Stake'], errors='coerce').fillna(0)
         
-        # Calculate Money Metrics
         df['Money_PL'] = df['P/L'] * df['Stake']
         total_money_pl = df['Money_PL'].sum()
         total_invested = df['Stake'].sum()
@@ -202,7 +193,6 @@ if st.button('🚀 Run Analysis'):
                             "P/L": 0.0
                         })
 
-# SHOW TOP 3 GOLD CARDS
 if st.session_state.value_horses:
     st.markdown("### 🏆 GOLD VALUE BETS")
     top_3 = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)[:3]
