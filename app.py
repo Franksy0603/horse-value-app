@@ -15,7 +15,6 @@ GSHEET_URL = st.secrets.get("gsheet_url", "")
 st.set_page_config(page_title="Value Finder Pro", layout="wide")
 st.title("🏇 Value Finder Pro: Automated Ledger")
 
-# Initialize session state
 if 'value_horses' not in st.session_state:
     st.session_state.value_horses = []
 if 'all_races' not in st.session_state:
@@ -33,22 +32,18 @@ def load_ledger():
     if conn and GSHEET_URL:
         try:
             df = conn.read(spreadsheet=GSHEET_URL, ttl=0)
-            # Ensure headers are strings and trimmed
             df.columns = [str(c).strip() for c in df.columns]
             return df
         except:
             pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "Pos", "P/L"])
 
-# --- 3. HELPER: THE ULTIMATE CLEANER ---
+# --- 3. HELPER: ULTIMATE CLEANER ---
 def clean_name(name):
-    """Removes (GB), (AUS), (AW), and all non-alphanumeric junk."""
     if not name or pd.isna(name): return ""
     text = str(name).upper()
-    # Remove anything in brackets/parentheses
-    text = re.sub(r'\(.*?\)', '', text)
-    # Remove non-alphanumeric characters
-    text = re.sub(r'[^A-Z0-9\s]', '', text)
+    text = re.sub(r'\(.*?\)', '', text) # Remove (GB), (AUS), etc.
+    text = re.sub(r'[^A-Z0-9\s]', '', text) # Remove punctuation
     return " ".join(text.split()).strip()
 
 # --- 4. DATA PROCESSING ENGINE ---
@@ -56,7 +51,6 @@ def process_data_and_update(file_data):
     all_positions = {} 
     results_list = file_data.get('results', [])
     
-    # 1. Map normalized names to positions from API/JSON data
     for race in results_list:
         course_name = clean_name(race.get('course', '')) 
         for runner in race.get('runners', []):
@@ -66,23 +60,16 @@ def process_data_and_update(file_data):
                 all_positions[f"{course_name}|{horse_name}"] = str(pos_val)
 
     df = load_ledger()
-    
-    # Critical Check: Ensure required columns exist
-    required = ["Course", "Horse", "Result", "Odds", "P/L"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        st.sidebar.error(f"Missing columns in Sheet: {missing}")
-        return
-
     if 'Pos' not in df.columns: df['Pos'] = "-"
     
     match_count = 0
     for index, row in df.iterrows():
-        # Only process 'Pending' rows
-        res_val = str(row['Result']).strip().title()
-        if res_val == 'Pending':
-            c_name = clean_name(row['Course'])
-            h_name = clean_name(row['Horse'])
+        # FUZZY STATUS CHECK: Catches "Pending", "pending", "Pending "
+        current_status = str(row.get('Result', '')).strip().upper()
+        
+        if current_status == "PENDING":
+            c_name = clean_name(row.get('Course', ''))
+            h_name = clean_name(row.get('Horse', ''))
             lookup_key = f"{c_name}|{h_name}"
             
             if lookup_key in all_positions:
@@ -100,40 +87,51 @@ def process_data_and_update(file_data):
     
     if match_count > 0:
         conn.update(spreadsheet=GSHEET_URL, data=df)
-        st.sidebar.success(f"✅ Successfully updated {match_count} bets!")
+        st.sidebar.success(f"✅ Updated {match_count} results!")
         st.rerun()
     else:
-        st.sidebar.warning("No matches found. Check Horse/Course names.")
+        st.sidebar.warning("No matches found. Ensure the horse name in your sheet matches the JSON horse name.")
 
-# --- 5. PERFORMANCE DASHBOARD ---
+# --- 5. PERFORMANCE DASHBOARD (RESTORED) ---
 st.sidebar.header("📊 Performance Dashboard")
 stake_input = st.sidebar.number_input("Standard Stake (£)", min_value=1, value=10)
 
 def display_sidebar_stats(s_val):
     df = load_ledger()
     if not df.empty and 'P/L' in df.columns:
-        df['P/L'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
-        total_pl = (df['P/L'] * s_val).sum()
-        st.sidebar.metric("Total Profit", f"£{total_pl:,.2f}")
+        # Calculate Stats
+        df['P/L_Num'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
+        df['Stake_Num'] = pd.to_numeric(df.get('Stake', s_val), errors='coerce').fillna(s_val)
+        
+        total_profit_cash = (df['P/L_Num'] * df['Stake_Num']).sum()
+        total_invested = df['Stake_Num'].sum()
+        roi = (total_profit_cash / total_invested * 100) if total_invested > 0 else 0
+        
+        # Display Metrics
+        color = "green" if total_profit_cash >= 0 else "red"
+        st.sidebar.markdown(f"### Profit: :{color}[£{total_profit_cash:,.2f}]")
+        
+        c1, c2 = st.sidebar.columns(2)
+        c1.metric("Invested", f"£{total_invested:,.0f}")
+        c2.metric("ROI", f"{roi:.1f}%")
         
         st.sidebar.markdown("---")
-        if st.sidebar.button("🔄 Auto Reconcile (Live)"):
+        # Sync Buttons
+        if st.sidebar.button("🔄 Auto Reconcile (Live API)"):
             auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
-            try:
-                r = requests.get("https://api.theracingapi.com/v1/results/live", auth=auth)
-                if r.status_code == 200: process_data_and_update(r.json())
-                else: st.sidebar.error(f"API Error {r.status_code}")
-            except Exception as e: st.sidebar.error(f"Sync failed: {e}")
+            r = requests.get("https://api.theracingapi.com/v1/results/live", auth=auth)
+            if r.status_code == 200: process_data_and_update(r.json())
+            else: st.sidebar.error(f"API Error {r.status_code}")
 
-        uploaded_file = st.sidebar.file_uploader("Upload Results JSON", type=["json"])
+        uploaded_file = st.sidebar.file_uploader("📂 Manual JSON Update", type=["json"])
         if uploaded_file and st.sidebar.button("🚀 Sync from File"):
             process_data_and_update(json.load(uploaded_file))
     else:
-        st.sidebar.info("Ledger is empty or columns are misaligned.")
+        st.sidebar.info("Ledger is empty.")
 
 display_sidebar_stats(stake_input)
 
-# --- 6. DATA PROCESSING ---
+# --- 6. ANALYSIS & LOGGING ---
 def get_best_odds(runner):
     sp_val = runner.get('sp_dec')
     if sp_val and str(sp_val).replace('.','',1).isdigit(): return float(sp_val)
@@ -152,12 +150,11 @@ def get_score(h):
         except: pass
     return s
 
-# --- 7. MAIN INTERFACE ---
 st.sidebar.markdown("---")
 min_score = st.sidebar.slider("Min Value Score", 0, 50, 20, 5)
 
 if st.button('🚀 Run Analysis'):
-    with st.spinner("Analyzing today's value..."):
+    with st.spinner("Analyzing cards..."):
         auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
         r = requests.get("https://api.theracingapi.com/v1/racecards/standard", auth=auth)
         if r.status_code == 200:
