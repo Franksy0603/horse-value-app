@@ -34,7 +34,6 @@ def load_ledger():
             df = conn.read(spreadsheet=GSHEET_URL, ttl=0)
             if df is not None:
                 df.columns = [str(c).strip() for c in df.columns]
-                # Defensive numeric conversion
                 for col in ["P/L", "Stake", "Odds"]:
                     if col in df.columns:
                         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0 if col != "Odds" else 1.0)
@@ -43,7 +42,7 @@ def load_ledger():
             st.error(f"⚠️ Sheet Load Error: {e}")
     return pd.DataFrame()
 
-# --- 3. SMART RECONCILE LOGIC ---
+# --- 3. RECONCILE LOGIC ---
 def clean_txt(text):
     if not text: return ""
     text = str(text).upper()
@@ -53,7 +52,7 @@ def clean_txt(text):
     return text.strip()
 
 def process_reconciliation(data):
-    """Processes available results and leaves others pending."""
+    """Reconciles whatever is in the data; leaves missing races 'Pending'."""
     try:
         results_map = {}
         for race in data.get('results', []):
@@ -67,11 +66,8 @@ def process_reconciliation(data):
         if df.empty: return
 
         settled_count = 0
-        still_pending = 0
-
         for i, row in df.iterrows():
-            current_res = str(row.get('Result', '')).strip().upper()
-            if current_res in ['PENDING', '-', '']:
+            if str(row.get('Result', '')).strip().upper() in ['PENDING', '-', '']:
                 l_key = f"{clean_txt(row.get('Course'))}|{clean_txt(row.get('Horse'))}"
                 
                 if l_key in results_map:
@@ -84,16 +80,13 @@ def process_reconciliation(data):
                         df.at[i, 'Result'] = 'Loser'
                         df.at[i, 'P/L'] = -1.0
                     settled_count += 1
-                else:
-                    still_pending += 1
 
         if settled_count > 0:
             conn.update(spreadsheet=GSHEET_URL, data=df)
-            st.success(f"✅ Settled {settled_count} bets.")
+            st.success(f"✅ Successfully settled {settled_count} bets!")
             st.rerun()
         else:
-            st.warning(f"No results found in API for your {still_pending} pending bets.")
-
+            st.warning("No matches found in the provided data. Rows remain 'Pending'.")
     except Exception as e:
         st.error(f"Reconciliation Error: {e}")
 
@@ -116,21 +109,25 @@ def display_sidebar_stats():
             c2.metric("ROI", f"{roi:.1f}%")
             
             st.sidebar.markdown("---")
-            if st.sidebar.button("🔄 Deep Sync (Last 3 Days)"):
+            st.sidebar.subheader("🔄 Reconcile Results")
+            
+            # MANUAL JSON UPLOAD
+            uploaded_file = st.sidebar.file_uploader("Upload Results JSON", type=["json"])
+            if uploaded_file:
+                if st.sidebar.button("🚀 Process Uploaded File"):
+                    process_reconciliation(json.load(uploaded_file))
+
+            # AUTO SYNC BUTTON
+            if st.sidebar.button("🔄 Auto-Sync (Today/Yesterday)"):
                 auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
                 combined = {"results": []}
-                # Increased lookback to 3 days to catch all weekend results
-                for day in range(4):
+                for day in [0, 1]:
                     d_str = (datetime.now() - timedelta(days=day)).strftime("%Y-%m-%d")
                     r = requests.get(f"https://api.theracingapi.com/v1/results/standard?date={d_str}", auth=auth)
                     if r.status_code == 200: 
                         combined["results"].extend(r.json().get('results', []))
-                
-                r_live = requests.get("https://api.theracingapi.com/v1/results/live", auth=auth)
-                if r_live.status_code == 200:
-                    combined["results"].extend(r_live.json().get('results', []))
-                
                 process_reconciliation(combined)
+                
     except Exception as e:
         st.sidebar.error(f"Stats Error: {e}")
 
@@ -155,7 +152,7 @@ def get_score(h):
 
 # --- 6. MAIN INTERFACE ---
 if st.button('🚀 Run Analysis'):
-    with st.spinner("Analyzing..."):
+    with st.spinner("Finding value..."):
         auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
         r = requests.get("https://api.theracingapi.com/v1/racecards/standard", auth=auth)
         if r.status_code == 200:
@@ -178,19 +175,27 @@ if st.session_state.value_horses:
     st.markdown("### 🏆 Gold Bets")
     cols = st.columns(min(3, len(st.session_state.value_horses)))
     for i, h in enumerate(st.session_state.value_horses[:3]):
-        cols[i].success(f"**{h['Horse']}**\n\n{h['Time']} {h['Course']}\n\nScore: {h['Score']}")
-    
-    if st.button("📤 Log Selections"):
+        with cols[i]:
+            st.markdown(f"""
+            <div style="background-color:#FFD700; padding:20px; border-radius:10px; border:2px solid #DAA520; text-align:center; color:#000;">
+                <h2 style="margin:0; color:#000;">{h['Horse']}</h2>
+                <p style="margin:5px 0; font-size:16px;"><b>{h['Time']} - {h['Course']}</b></p>
+                <hr style="border-top: 1px solid #DAA520;">
+                <p style="font-size:20px; margin:5px;"><b>Score: {h['Score']}</b></p>
+                <p style="font-size:18px; margin:0;">Odds: {int(h['Odds']-1) if h['Odds'] > 1 else 'SP'}/1</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("📤 Log All Selections"):
         ledger = load_ledger()
         new_df = pd.DataFrame(st.session_state.value_horses)
         if not ledger.empty:
-            new_df = new_df[~new_df.apply(lambda x: ((ledger['Horse'] == x['Horse']) & 
-                                                      (ledger['Course'] == x['Course']) & 
-                                                      (ledger['Date'] == x['Date'])).any(), axis=1)]
+            new_df = new_df[~new_df.apply(lambda x: ((ledger['Horse'] == x['Horse']) & (ledger['Course'] == x['Course'])).any(), axis=1)]
         if not new_df.empty:
             updated = pd.concat([ledger, new_df], ignore_index=True)
             conn.update(spreadsheet=GSHEET_URL, data=updated)
-            st.success(f"Logged {len(new_df)} selections!")
+            st.success(f"Logged {len(new_df)} new selections!")
             st.rerun()
 
 if st.session_state.all_races:
