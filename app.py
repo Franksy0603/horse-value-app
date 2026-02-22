@@ -36,12 +36,15 @@ def load_ledger():
             pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "Pos", "P/L"])
 
-# --- 3. HELPER: NAME CLEANER ---
+# --- 3. HELPER: FUZZY NAME CLEANER ---
 def clean_name(name):
-    """Removes (GB), (IRE), etc., and extra whitespace/casing."""
+    """Deep cleans names to ensure matches between Spreadsheet and API."""
     if not name: return ""
-    # Remove anything in parentheses and strip whitespace
+    # 1. Remove country suffixes in parentheses: "Horse Name (IRE)" -> "Horse Name"
     name = re.sub(r'\(.*?\)', '', str(name))
+    # 2. Remove non-alphanumeric chars (apostrophes, hyphens): "It's A Tie" -> "ITS A TIE"
+    name = re.sub(r'[^a-zA-Z0-9\s]', '', name)
+    # 3. Uppercase and strip extra whitespace
     return name.strip().upper()
 
 # --- 4. SMART JSON RESULT & POSITION MATCHER ---
@@ -62,6 +65,7 @@ def upload_json_data():
                     horse_name = clean_name(runner.get('horse', ''))
                     pos_val = runner.get('position')
                     if pos_val is not None:
+                        # Map normalized Course|Horse to the position
                         all_positions[f"{course_name}|{horse_name}"] = str(pos_val)
 
             if st.sidebar.button("🚀 Sync Positions & Results"):
@@ -70,6 +74,7 @@ def upload_json_data():
                 
                 match_count = 0
                 for index, row in df.iterrows():
+                    # We only update rows currently marked as 'Pending'
                     if str(row['Result']).strip().title() == 'Pending':
                         c_name = clean_name(row['Course'])
                         h_name = clean_name(row['Horse'])
@@ -90,10 +95,10 @@ def upload_json_data():
                 
                 if match_count > 0:
                     conn.update(spreadsheet=GSHEET_URL, data=df)
-                    st.sidebar.success(f"✅ Synced {match_count} positions!")
+                    st.sidebar.success(f"✅ Successfully updated {match_count} bets!")
                     st.rerun()
                 else:
-                    st.sidebar.warning("Still no matches. Ensure Course and Horse names match the JSON content.")
+                    st.sidebar.warning("No matches found. Ensure the JSON covers the dates of your pending bets.")
         except Exception as e:
             st.sidebar.error(f"JSON Error: {e}")
 
@@ -178,6 +183,7 @@ if st.session_state.value_horses:
         ledger = load_ledger()
         new_df = pd.DataFrame(st.session_state.value_horses)
         today_str = datetime.now().strftime("%Y-%m-%d")
+        # Only log if not already there today
         filtered = new_df[~new_df['Horse'].isin(ledger[ledger['Date'] == today_str]['Horse'])]
         if not filtered.empty:
             conn.update(spreadsheet=GSHEET_URL, data=pd.concat([ledger, filtered], ignore_index=True))
