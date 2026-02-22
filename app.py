@@ -38,12 +38,12 @@ def load_ledger():
 
 # --- 3. HELPER: AGGRESSIVE NAME CLEANER ---
 def clean_name(name):
-    """Deep cleans names to ensure matches between Spreadsheet and API."""
+    """Deep cleans names from BOTH sources for foolproof matching."""
     if not name: return ""
     text = str(name).upper()
     # Remove everything in parentheses: "(GB)", "(IRE)", "(AW)"
     text = re.sub(r'\(.*?\)', '', text)
-    # Remove non-alphanumeric characters (apostrophes, hyphens, etc)
+    # Remove all non-alphanumeric characters
     text = re.sub(r'[^A-Z0-9\s]', '', text)
     # Collapse multiple spaces and strip
     return " ".join(text.split())
@@ -53,25 +53,26 @@ def process_data_and_update(file_data):
     all_positions = {} 
     results_list = file_data.get('results', [])
     
-    # Map normalized names to positions from API/JSON data
+    # 1. Map normalized names to positions from API/JSON data
     for race in results_list:
-        # CLEAN COURSE NAME FROM JSON (e.g., "Chelmsford (AW)" -> "CHELMSFORD")
+        # Clean Course from JSON
         course_name = clean_name(race.get('course', '')) 
         for runner in race.get('runners', []):
-            # CLEAN HORSE NAME FROM JSON (e.g., "Fast Bullet (GB)" -> "FAST BULLET")
+            # Clean Horse from JSON
             horse_name = clean_name(runner.get('horse', ''))
             pos_val = runner.get('position')
             if pos_val is not None:
+                # Store by CleanedCourse|CleanedHorse
                 all_positions[f"{course_name}|{horse_name}"] = str(pos_val)
 
     df = load_ledger()
     if 'Pos' not in df.columns: df['Pos'] = "-"
     
     match_count = 0
+    # 2. Iterate through Sheet looking for ANY 'Pending' row regardless of date
     for index, row in df.iterrows():
-        # Only update if the row is still 'Pending'
         if str(row['Result']).strip().title() == 'Pending':
-            # CLEAN BOTH FROM SPREADSHEET TO ENSURE MATCH
+            # Clean Course and Horse from Spreadsheet for matching
             c_name = clean_name(row['Course'])
             h_name = clean_name(row['Horse'])
             lookup_key = f"{c_name}|{h_name}"
@@ -80,6 +81,7 @@ def process_data_and_update(file_data):
                 actual_pos = all_positions[lookup_key]
                 df.at[index, 'Pos'] = actual_pos
                 
+                # Logic: Winner if Pos is 1
                 if actual_pos == '1':
                     df.at[index, 'Result'] = 'Winner'
                     odds = pd.to_numeric(row['Odds'], errors='coerce') or 1.0
@@ -94,7 +96,7 @@ def process_data_and_update(file_data):
         st.sidebar.success(f"✅ Successfully updated {match_count} bets!")
         st.rerun()
     else:
-        st.sidebar.warning("No matches found. Ensure the names in your sheet align with the JSON.")
+        st.sidebar.warning("No matches found. Check Horse/Course columns in your sheet.")
 
 # --- 5. PERFORMANCE DASHBOARD ---
 st.sidebar.header("📊 Performance Dashboard")
@@ -117,7 +119,7 @@ def display_sidebar_stats(s_val):
             c2.metric("ROI", f"{(total_money_pl / total_invested) * 100:.1f}%")
         
         st.sidebar.markdown("---")
-        # AUTO RECONCILE
+        # AUTO RECONCILE (LIVE API)
         if st.sidebar.button("🔄 Auto Reconcile (Live API)"):
             st.sidebar.info("Fetching live results...")
             auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
@@ -126,9 +128,9 @@ def display_sidebar_stats(s_val):
                 if r.status_code == 200:
                     process_data_and_update(r.json())
                 elif r.status_code == 422:
-                    st.sidebar.error("API Error 422: Data is currently locked/processing. Use Manual JSON.")
+                    st.sidebar.error("API Error 422: Data is currently locked. Use Manual JSON.")
                 else:
-                    st.sidebar.error(f"API Error {r.status_code}. Try again later.")
+                    st.sidebar.error(f"API Error {r.status_code}.")
             except Exception as e:
                 st.sidebar.error(f"Sync failed: {e}")
 
