@@ -1,6 +1,5 @@
 import streamlit as st
-import pd as pd
-import pd
+import pandas as pd  # Fixed the import error here
 import requests
 import json
 import re
