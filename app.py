@@ -33,9 +33,10 @@ def load_ledger():
             return conn.read(spreadsheet=GSHEET_URL, ttl=0)
         except:
             pass
-    return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "P/L"])
+    # Default columns including the new 'Pos' field
+    return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "Pos", "P/L"])
 
-# --- 3. UPDATED: SMART JSON RESULT MATCHER ---
+# --- 3. SMART JSON RESULT & POSITION MATCHER ---
 def upload_json_data():
     st.sidebar.markdown("---")
     st.sidebar.subheader("📂 Smart Results Update")
@@ -44,62 +45,49 @@ def upload_json_data():
     if uploaded_file is not None:
         try:
             file_data = json.load(uploaded_file)
-            all_winners = []
+            all_positions = {} 
 
-            # Extract winners from JSON results
             if isinstance(file_data, dict) and 'results' in file_data:
                 for race in file_data['results']:
                     course_name = str(race.get('course', '')).upper().strip()
                     for runner in race.get('runners', []):
-                        if str(runner.get('position')) == '1':
-                            horse_name = str(runner.get('horse', '')).upper().strip()
-                            all_winners.append(f"{course_name}|{horse_name}")
+                        horse_name = str(runner.get('horse', '')).upper().strip()
+                        pos = str(runner.get('position', ''))
+                        # Store both course and horse to ensure unique matching
+                        all_positions[f"{course_name}|{horse_name}"] = pos
 
-            if st.sidebar.button("🚀 Update My Pending Bets"):
+            if st.sidebar.button("🚀 Sync Positions & Results"):
                 df = load_ledger()
                 match_count = 0
                 
-                # We only want to update horses currently in the spreadsheet marked 'Pending'
                 for index, row in df.iterrows():
+                    # Only update if result is still Pending or Pos is missing
                     if str(row['Result']).strip().title() == 'Pending':
                         c_name = str(row['Course']).upper().strip()
                         h_name = str(row['Horse']).upper().strip()
                         lookup_key = f"{c_name}|{h_name}"
                         
-                        if lookup_key in all_winners:
-                            df.at[index, 'Result'] = 'Winner'
-                            # Ensure Odds is a float for P/L calculation
-                            odds = float(row['Odds']) if row['Odds'] else 1.0
-                            df.at[index, 'P/L'] = odds - 1
+                        if lookup_key in all_positions:
+                            actual_pos = all_positions[lookup_key]
+                            df.at[index, 'Pos'] = actual_pos
+                            
+                            if actual_pos == '1':
+                                df.at[index, 'Result'] = 'Winner'
+                                odds = pd.to_numeric(row['Odds'], errors='coerce') or 1.0
+                                df.at[index, 'P/L'] = odds - 1
+                            else:
+                                df.at[index, 'Result'] = 'Loser'
+                                df.at[index, 'P/L'] = -1.0
                             match_count += 1
-                        else:
-                            # Logic: If the race date is in the past, it's a loser
-                            try:
-                                race_date = datetime.strptime(str(row['Date']), "%Y-%m-%d").date()
-                                if race_date < datetime.now().date():
-                                    df.at[index, 'Result'] = 'Loser'
-                                    df.at[index, 'P/L'] = -1.0
-                                    match_count += 1
-                            except: continue
-
+                
                 if match_count > 0:
                     conn.update(spreadsheet=GSHEET_URL, data=df)
-                    st.sidebar.success(f"✅ Updated {match_count} existing bets!")
+                    st.sidebar.success(f"✅ Updated {match_count} horses!")
                     st.rerun()
-                else:
-                    st.sidebar.warning("No matching pending bets found in this file.")
         except Exception as e:
             st.sidebar.error(f"JSON Error: {e}")
 
-# --- 4. DASHBOARD & RECONCILE ---
-def reconcile_results():
-    # Standard API reconciliation logic
-    auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
-    r = requests.get("https://api.theracingapi.com/v1/results/live", auth=auth)
-    if r.status_code == 200:
-        # (Logic omitted for brevity, same as previous version)
-        pass
-
+# --- 4. PERFORMANCE DASHBOARD ---
 st.sidebar.header("📊 Performance Dashboard")
 stake_input = st.sidebar.number_input("Standard Stake (£)", min_value=1, value=10, step=1)
 
@@ -108,6 +96,7 @@ def display_sidebar_stats(s_val):
     if not df.empty:
         df['P/L'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
         df['Stake'] = pd.to_numeric(df.get('Stake', s_val), errors='coerce').fillna(s_val)
+        
         total_money_pl = (df['P/L'] * df['Stake']).sum()
         total_invested = df['Stake'].sum()
         
@@ -119,7 +108,6 @@ def display_sidebar_stats(s_val):
         if total_invested > 0:
             c2.metric("ROI", f"{(total_money_pl / total_invested) * 100:.1f}%")
         
-        st.sidebar.markdown("---")
         upload_json_data()
     else:
         st.sidebar.info("Ledger is empty.")
@@ -127,11 +115,16 @@ def display_sidebar_stats(s_val):
 
 display_sidebar_stats(stake_input)
 
-# --- 5. DATA PROCESSING & INTERFACE ---
+# --- 5. DATA PROCESSING ---
 def get_best_odds(runner):
     sp_val = runner.get('sp_dec')
     if sp_val and str(sp_val).replace('.','',1).isdigit(): return float(sp_val)
-    prices = [float(e.get('decimal')) for e in runner.get('odds', []) if str(e.get('decimal', '')).replace('.','',1).isdigit()]
+    prices = []
+    odds_list = runner.get('odds', [])
+    if isinstance(odds_list, list):
+        for e in odds_list:
+            val = str(e.get('decimal', '')).replace('.','',1)
+            if val.isdigit(): prices.append(float(e.get('decimal')))
     return max(prices) if prices else 0.0
 
 def get_score(h):
@@ -140,10 +133,13 @@ def get_score(h):
     t_stats = h.get('trainer_14_days', {})
     if isinstance(t_stats, dict):
         try:
-            if float(t_stats.get('percent', 0)) > 20: s += 15
+            win_pc = float(t_stats.get('percent', 0))
+            if win_pc > 20: s += 15
+            elif win_pc > 10: s += 5
         except: pass
     return s
 
+# --- 6. MAIN INTERFACE ---
 st.sidebar.markdown("---")
 min_score = st.sidebar.slider("Min Value Score", 0, 50, 20, 5)
 
@@ -162,7 +158,8 @@ if st.button('🚀 Run Analysis'):
                             "Date": datetime.now().strftime("%Y-%m-%d"),
                             "Horse": r_data.get('horse'), "Course": race.get('course'),
                             "Time": race.get('off_time', race.get('off')), "Odds": odds,
-                            "Score": score, "Stake": stake_input, "Result": "Pending", "P/L": 0.0
+                            "Score": score, "Stake": stake_input, 
+                            "Result": "Pending", "Pos": "-", "P/L": 0.0
                         })
 
 if st.session_state.value_horses:
@@ -171,12 +168,21 @@ if st.session_state.value_horses:
     cols = st.columns(3)
     for i, h in enumerate(top_3):
         with cols[i]:
-            st.markdown(f'<div style="background-color:#FFD700; padding:20px; border-radius:10px; border:2px solid #DAA520; text-align:center; color:#000;"><h2>{h["Horse"]}</h2><p><b>{h["Time"]} - {h["Course"]}</b></p><hr><b>Score: {h["Score"]}</b><br>Odds: {int(h["Odds"]-1)}/1</div>', unsafe_allow_html=True)
+            st.markdown(f"""
+            <div style="background-color:#FFD700; padding:20px; border-radius:10px; border:2px solid #DAA520; text-align:center; color:#000;">
+                <h2 style="margin:0; color:#000;">{h['Horse']}</h2>
+                <p style="margin:5px 0; font-size:16px;"><b>{h['Time']} - {h['Course']}</b></p>
+                <hr style="border-top: 1px solid #DAA520;">
+                <p style="font-size:20px; margin:5px;"><b>Score: {h['Score']}</b></p>
+                <p style="font-size:18px; margin:0;">Odds: {int(h['Odds']-1) if h['Odds'] > 1 else 'SP'}/1</p>
+            </div>
+            """, unsafe_allow_html=True)
     
-    if st.button("📤 LOG SELECTIONS"):
+    if st.button("📤 LOG SELECTIONS TO GOOGLE SHEETS"):
         ledger = load_ledger()
         new_df = pd.DataFrame(st.session_state.value_horses)
-        filtered = new_df[~new_df['Horse'].isin(ledger['Horse'])]
+        # Unique check based on Horse and Date
+        filtered = new_df[~new_df['Horse'].isin(ledger[ledger['Date'] == datetime.now().strftime("%Y-%m-%d")]['Horse'])]
         if not filtered.empty:
             conn.update(spreadsheet=GSHEET_URL, data=pd.concat([ledger, filtered], ignore_index=True))
             st.balloons()
