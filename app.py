@@ -89,7 +89,7 @@ def reconcile_results():
     except Exception as e:
         st.sidebar.error(f"Request failed: {e}")
 
-# --- 4. JSON UPLOAD TOOL ---
+# --- 4. ROBUST JSON UPLOAD TOOL ---
 def upload_json_data():
     st.sidebar.markdown("---")
     st.sidebar.subheader("📂 Restore from JSON")
@@ -98,35 +98,50 @@ def upload_json_data():
     if uploaded_file is not None:
         try:
             file_data = json.load(uploaded_file)
-            # Check if this is a Results JSON or a Selections JSON
             raw_rows = []
             
-            # If it's a Results JSON, we extract the winners
-            if 'results' in file_data:
+            # Helper to safely convert strings to floats
+            def safe_float(val, default=0.0):
+                try:
+                    if val is None or str(val).strip() == "":
+                        return default
+                    return float(val)
+                except (ValueError, TypeError):
+                    return default
+
+            if isinstance(file_data, dict) and 'results' in file_data:
                 for race in file_data['results']:
                     for runner in race.get('runners', []):
                         if str(runner.get('position')) == '1':
+                            odds_val = safe_float(runner.get('sp_dec'), 1.0)
                             raw_rows.append({
                                 "Date": race.get('date', datetime.now().strftime("%Y-%m-%d")),
                                 "Horse": runner.get('horse'),
                                 "Course": race.get('course'),
                                 "Result": "Winner",
-                                "Odds": runner.get('sp_dec', 0),
-                                "P/L": float(runner.get('sp_dec', 1)) - 1
+                                "Odds": odds_val,
+                                "P/L": odds_val - 1 if odds_val > 0 else 0.0
                             })
             else:
-                # Assume it's a direct list of selections
-                raw_rows = file_data
+                # Direct selections list - apply safety to all numeric fields
+                if isinstance(file_data, list):
+                    for item in file_data:
+                        item['Odds'] = safe_float(item.get('Odds'), 1.0)
+                        item['P/L'] = safe_float(item.get('P/L'), 0.0)
+                        item['Score'] = safe_float(item.get('Score'), 0.0)
+                        item['Stake'] = safe_float(item.get('Stake'), 10.0)
+                        raw_rows = file_data
 
-            new_df = pd.DataFrame(raw_rows)
-            if st.sidebar.button("🚀 Merge into Ledger"):
-                ledger_df = load_ledger()
-                updated_ledger = pd.concat([ledger_df, new_df], ignore_index=True).drop_duplicates(subset=['Horse', 'Date'], keep='first')
-                conn.update(spreadsheet=GSHEET_URL, data=updated_ledger)
-                st.sidebar.success("Ledger Updated!")
-                st.rerun()
+            if raw_rows:
+                new_df = pd.DataFrame(raw_rows)
+                if st.sidebar.button("🚀 Merge into Ledger"):
+                    ledger_df = load_ledger()
+                    updated_ledger = pd.concat([ledger_df, new_df], ignore_index=True).drop_duplicates(subset=['Horse', 'Date'], keep='first')
+                    conn.update(spreadsheet=GSHEET_URL, data=updated_ledger)
+                    st.sidebar.success(f"Successfully merged data!")
+                    st.rerun()
         except Exception as e:
-            st.sidebar.error(f"JSON Error: {e}")
+            st.sidebar.error(f"Critical Upload Error: {e}")
 
 # --- 5. PERFORMANCE DASHBOARD ---
 st.sidebar.header("📊 Performance Dashboard")
