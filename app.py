@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 from requests.auth import HTTPBasicAuth
-from datetime import datetime, timedelta
+from datetime import datetime
 from streamlit_gsheets import GSheetsConnection
 
 # --- 1. SETTINGS & SECRETS ---
@@ -32,83 +32,105 @@ def load_ledger():
             return conn.read(spreadsheet=GSHEET_URL, ttl=0)
         except:
             pass
-    return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Result", "P/L"])
+    return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "P/L"])
 
-# --- 3. AUTO-RECONCILE LOGIC ---
+# --- 3. ROBUST RECONCILE LOGIC ---
 def reconcile_results():
     df = load_ledger()
-    if df.empty or "Pending" not in df['Result'].values:
-        st.sidebar.info("No pending bets to reconcile.")
+    if df.empty:
+        st.sidebar.warning("Ledger is empty.")
         return
 
-    st.sidebar.info("🔄 Checking results...")
+    # Look for 'Pending' (case-insensitive and stripping whitespace)
+    pending_mask = df['Result'].str.strip().str.title() == 'Pending'
+    pending_rows = df[pending_mask]
+    
+    if pending_rows.empty:
+        st.sidebar.info("No 'Pending' bets found to reconcile.")
+        return
+
+    st.sidebar.info(f"🔄 Checking {len(pending_rows)} bets against results...")
     auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
     
-    # We check results for the last 2 days to be safe
+    # Fetch latest results from the API
     r = requests.get("https://api.theracingapi.com/v1/results/standard", auth=auth)
+    
     if r.status_code == 200:
         results_data = r.json().get('results', [])
         
-        # Create a dictionary of winners for fast lookup
-        winners = []
+        # Create a matching key of Course + Horse for every winner found in the API
+        winners_list = []
         for race in results_data:
+            course_name = str(race.get('course', '')).upper().strip()
             for runner in race.get('runners', []):
-                if str(runner.get('result')).strip().lower() == '1':
-                    winners.append(runner.get('horse').upper())
+                if str(runner.get('result')) == '1': # '1' indicates the winner
+                    horse_name = str(runner.get('horse', '')).upper().strip()
+                    winners_list.append(f"{course_name}|{horse_name}")
 
-        # Update the dataframe
-        updated = False
+        match_count = 0
         for index, row in df.iterrows():
-            if row['Result'] == 'Pending':
-                horse_name = str(row['Horse']).upper()
-                # Check if this horse is in our winner list
-                if horse_name in winners:
+            if str(row['Result']).strip().title() == 'Pending':
+                c_name = str(row['Course']).upper().strip()
+                h_name = str(row['Horse']).upper().strip()
+                lookup_key = f"{c_name}|{h_name}"
+                
+                if lookup_key in winners_list:
                     df.at[index, 'Result'] = 'Winner'
                     df.at[index, 'P/L'] = float(row['Odds']) - 1
-                    updated = True
                 else:
-                    # Note: In a real scenario, you'd verify the race actually finished
-                    # For now, we assume if it's not a winner in the results, it's a loser
+                    # Note: If checking Sunday for Saturday results, we assume not in winner list = loser
                     df.at[index, 'Result'] = 'Loser'
                     df.at[index, 'P/L'] = -1.0
-                    updated = True
+                match_count += 1
         
-        if updated:
+        if match_count > 0:
             conn.update(spreadsheet=GSHEET_URL, data=df)
-            st.sidebar.success("✅ Ledger Updated!")
+            st.sidebar.success(f"✅ Settled {match_count} bets!")
             st.rerun()
+        else:
+            st.sidebar.warning("API results for these races aren't available yet.")
+    else:
+        st.sidebar.error(f"API Error: {r.status_code}")
 
 # --- 4. SIDEBAR DASHBOARD ---
 st.sidebar.header("📊 Performance Dashboard")
-stake = st.sidebar.number_input("Stake per Bet (£)", min_value=1, value=10, step=1)
+stake_input = st.sidebar.number_input("Current Stake (£)", min_value=1, value=10, step=1)
 
-def display_sidebar_stats(stake_val):
+def display_sidebar_stats(s_val):
     df = load_ledger()
     if not df.empty:
+        # Convert columns to numeric for calculation
         df['P/L'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
-        total_points = df['P/L'].sum()
-        total_money = total_points * stake_val
+        df['Stake'] = pd.to_numeric(df['Stake'], errors='coerce').fillna(0)
         
-        total_bets = len(df[df['Result'] != 'Pending'])
-        winners = len(df[df['Result'] == 'Winner'])
-        win_rate = (winners / total_bets * 100) if total_bets > 0 else 0
+        # Calculate Money P/L (Each bet's P/L points * its specific stake)
+        df['Money_PL'] = df['P/L'] * df['Stake']
+        total_money_pl = df['Money_PL'].sum()
+        total_invested = df['Stake'].sum()
         
-        pl_color = "green" if total_money >= 0 else "red"
-        st.sidebar.markdown(f"### Total P/L: :{pl_color}[£{total_money:,.2f}]")
-        st.sidebar.caption(f"({total_points:+.2f} points)")
+        # Filter for settled bets (non-pending)
+        settled_df = df[df['Result'].str.strip().str.title() != 'Pending']
+        total_bets = len(settled_df)
+        winners = len(df[df['Result'].str.strip().str.title() == 'Winner'])
         
-        col1, col2 = st.sidebar.columns(2)
-        col1.metric("Settled Bets", total_bets)
-        col2.metric("Win Rate", f"{win_rate:.1f}%")
+        pl_color = "green" if total_money_pl >= 0 else "red"
+        st.sidebar.markdown(f"### Total P/L: :{pl_color}[£{total_money_pl:,.2f}]")
         
-        if st.sidebar.button("🔄 Reconcile Pending Bets"):
+        c1, c2 = st.sidebar.columns(2)
+        c1.metric("Invested", f"£{total_invested}")
+        if total_invested > 0:
+            roi = (total_money_pl / total_invested) * 100
+            c2.metric("ROI", f"{roi:.1f}%")
+        
+        st.sidebar.markdown("---")
+        if st.sidebar.button("🔄 Reconcile Yesterday's Bets"):
             reconcile_results()
     else:
         st.sidebar.info("Ledger is empty.")
 
-display_sidebar_stats(stake)
+display_sidebar_stats(stake_input)
 
-# --- 5. DATA CLEANING & SCORING ---
+# --- 5. DATA PROCESSING ---
 def get_best_odds(runner):
     sp_val = runner.get('sp_dec')
     if sp_val and str(sp_val).replace('.','',1).isdigit():
@@ -138,7 +160,7 @@ def get_score(h):
 
 # --- 6. MAIN INTERFACE ---
 st.sidebar.markdown("---")
-st.sidebar.header("⚙️ Controls")
+st.sidebar.header("⚙️ Analysis Controls")
 min_score = st.sidebar.slider("Min Value Score", 0, 50, 20, 5)
 
 if st.button('🚀 Run Analysis'):
@@ -162,11 +184,11 @@ if st.button('🚀 Run Analysis'):
                             "Time": race.get('off_time', race.get('off')),
                             "Odds": odds,
                             "Score": score,
+                            "Stake": stake_input,
                             "Result": "Pending",
                             "P/L": 0.0
                         })
 
-# SHOW TOP 3 GOLD CARDS
 if st.session_state.value_horses:
     st.markdown("### 🏆 GOLD VALUE BETS")
     top_3 = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)[:3]
@@ -184,24 +206,25 @@ if st.session_state.value_horses:
             """, unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("📤 LOG ALL SELECTIONS"):
+    if st.button("📤 LOG ALL SELECTIONS TO GOOGLE SHEETS"):
         if conn:
             try:
                 ledger = load_ledger()
-                new_data = pd.DataFrame(st.session_state.value_horses)
-                filtered = new_data[~new_data['Horse'].isin(ledger['Horse'])]
+                new_df = pd.DataFrame(st.session_state.value_horses)
+                # Filter to avoid double-logging the same horse on the same day
+                filtered = new_df[~new_df['Horse'].isin(ledger['Horse'])]
+                
                 if not filtered.empty:
                     updated_df = pd.concat([ledger, filtered], ignore_index=True)
                     conn.update(spreadsheet=GSHEET_URL, data=updated_df)
                     st.balloons()
-                    st.success(f"Logged {len(filtered)} bets!")
+                    st.success(f"Successfully logged {len(filtered)} bets!")
                     st.rerun()
                 else:
-                    st.info("Already in ledger.")
+                    st.info("Today's horses are already in the ledger.")
             except Exception as e:
-                st.error(f"Failed: {e}")
+                st.error(f"Logging Failed: {e}")
 
-# FULL RACE BREAKDOWN
 if st.session_state.all_races:
     for race in st.session_state.all_races:
         with st.expander(f"🕒 {race.get('off_time', race.get('off'))} - {race.get('course')}"):
