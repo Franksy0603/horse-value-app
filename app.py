@@ -34,14 +34,14 @@ def load_ledger():
             pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "P/L"])
 
-# --- 3. ROBUST RECONCILE (DATE-SPECIFIC) ---
+# --- 3. RECONCILE WITH 422 ERROR HANDLING ---
 def reconcile_results():
     df = load_ledger()
     if df.empty:
         st.sidebar.warning("Ledger is empty.")
         return
 
-    # Check for 'Pending' rows
+    # Look for 'Pending' rows
     pending_mask = df['Result'].str.strip().str.title() == 'Pending'
     pending_rows = df[pending_mask]
     
@@ -49,7 +49,7 @@ def reconcile_results():
         st.sidebar.info("No 'Pending' bets found.")
         return
 
-    # Get unique dates from pending bets to avoid 422 errors
+    # Get unique dates from pending bets
     unique_dates = pending_rows['Date'].unique()
     
     st.sidebar.info(f"🔄 Checking {len(pending_rows)} bets...")
@@ -59,6 +59,7 @@ def reconcile_results():
     # Fetch results for the specific dates in the ledger
     for date_str in unique_dates:
         r = requests.get(f"https://api.theracingapi.com/v1/results/standard?date={date_str}", auth=auth)
+        
         if r.status_code == 200:
             results_data = r.json().get('results', [])
             for race in results_data:
@@ -67,9 +68,18 @@ def reconcile_results():
                     if str(runner.get('result')) == '1':
                         horse_name = str(runner.get('horse', '')).upper().strip()
                         all_winners.append(f"{course_name}|{horse_name}")
+        elif r.status_code == 422:
+            # Handle the processing lag gracefully
+            st.sidebar.warning(f"⚠️ API results for {date_str} are still being processed. Please try again in an hour.")
+            return 
         else:
-            st.sidebar.error(f"API Error for {date_str}: {r.status_code}")
+            st.sidebar.error(f"API Error {r.status_code} for {date_str}")
             return
+
+    # Only proceed if we actually successfully retrieved a list of winners
+    if not all_winners:
+        st.sidebar.info("Awaiting official results...")
+        return
 
     match_count = 0
     today = datetime.now().date()
@@ -80,13 +90,12 @@ def reconcile_results():
             h_name = str(row['Horse']).upper().strip()
             lookup_key = f"{c_name}|{h_name}"
             
-            # Match horse against winners
             if lookup_key in all_winners:
                 df.at[index, 'Result'] = 'Winner'
                 df.at[index, 'P/L'] = float(row['Odds']) - 1
                 match_count += 1
             else:
-                # Only mark as loser if the race date has actually passed
+                # Mark as loser only if race date is in the past
                 race_date = datetime.strptime(str(row['Date']), "%Y-%m-%d").date()
                 if race_date < today:
                     df.at[index, 'Result'] = 'Loser'
@@ -97,8 +106,6 @@ def reconcile_results():
         conn.update(spreadsheet=GSHEET_URL, data=df)
         st.sidebar.success(f"✅ Settled {match_count} bets!")
         st.rerun()
-    else:
-        st.sidebar.warning("No matches found in API results yet.")
 
 # --- 4. SIDEBAR DASHBOARD ---
 st.sidebar.header("📊 Performance Dashboard")
@@ -107,7 +114,10 @@ stake_input = st.sidebar.number_input("Standard Stake (£)", min_value=1, value=
 def display_sidebar_stats(s_val):
     df = load_ledger()
     if not df.empty:
-        # Ensure correct data types
+        # Ensure 'Stake' column exists
+        if 'Stake' not in df.columns:
+            df['Stake'] = s_val
+            
         df['P/L'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
         df['Stake'] = pd.to_numeric(df['Stake'], errors='coerce').fillna(0)
         
@@ -192,7 +202,6 @@ if st.button('🚀 Run Analysis'):
                             "P/L": 0.0
                         })
 
-# SHOW TOP 3 GOLD CARDS
 if st.session_state.value_horses:
     st.markdown("### 🏆 GOLD VALUE BETS")
     top_3 = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)[:3]
@@ -215,9 +224,7 @@ if st.session_state.value_horses:
             try:
                 ledger = load_ledger()
                 new_df = pd.DataFrame(st.session_state.value_horses)
-                # Verify column structure exists in new data
                 filtered = new_df[~new_df['Horse'].isin(ledger['Horse'])]
-                
                 if not filtered.empty:
                     updated_df = pd.concat([ledger, filtered], ignore_index=True)
                     conn.update(spreadsheet=GSHEET_URL, data=updated_df)
