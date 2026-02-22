@@ -4,7 +4,7 @@ import requests
 import json
 import re
 from requests.auth import HTTPBasicAuth
-from datetime import datetime
+from datetime import datetime, timedelta
 from streamlit_gsheets import GSheetsConnection
 
 # --- 1. SETTINGS & SECRETS ---
@@ -37,56 +37,78 @@ def load_ledger():
         except: pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "Pos", "P/L"])
 
-# --- 3. RECONCILE LOGIC (Enhanced Precision) ---
+# --- 3. RECONCILE LOGIC (Enhanced Precision & Diagnostics) ---
 def clean_txt(text):
     if not text: return ""
-    # Removes parentheses like (AW), (IRE), (GB) and punctuation
-    t = re.sub(r'\(.*?\)', '', str(text)) 
-    t = re.sub(r'[^A-Za-z0-9\s]', '', t)
-    return " ".join(t.split()).upper().strip()
+    # 1. Remove text in brackets (e.g., (IRE), (AW), (GB))
+    text = re.sub(r'\(.*?\)', '', str(text))
+    # 2. Remove all non-alphanumeric characters (keep spaces)
+    text = re.sub(r'[^A-Za-z0-9\s]', '', text)
+    # 3. Standardize whitespace and uppercase
+    return " ".join(text.split()).upper().strip()
 
 def process_reconciliation(data):
-    """Processes JSON data to update the ledger with positions and P/L."""
+    """Processes JSON results to update ledger with detailed matching."""
     results_map = {}
+    api_sample_keys = [] # For diagnostics
+    
     for race in data.get('results', []):
         course = clean_txt(race.get('course', ''))
         for runner in race.get('runners', []):
             horse = clean_txt(runner.get('horse', ''))
             pos = str(runner.get('position', ''))
-            results_map[f"{course}|{horse}"] = pos
+            key = f"{course}|{horse}"
+            results_map[key] = pos
+            api_sample_keys.append(key)
 
     df = load_ledger()
-    if df.empty: return
+    if df.empty: 
+        st.error("Could not load ledger.")
+        return
 
+    # Ensure settlement columns exist
     for col in ['Pos', 'Result', 'P/L']:
         if col not in df.columns: df[col] = "-"
 
     match_count = 0
+    mismatch_details = []
+
     for i, row in df.iterrows():
-        # Look specifically for Pending rows
-        if str(row.get('Result', '')).strip().upper() == 'PENDING':
-            key = f"{clean_txt(row.get('Course'))}|{clean_txt(row.get('Horse'))}"
+        # Only process bets marked as Pending
+        if str(row.get('Result', '')).strip().title() == 'Pending':
+            c_cleaned = clean_txt(row.get('Course'))
+            h_cleaned = clean_txt(row.get('Horse'))
+            lookup_key = f"{c_cleaned}|{h_cleaned}"
             
-            if key in results_map:
-                final_pos = results_map[key]
+            if lookup_key in results_map:
+                final_pos = results_map[lookup_key]
                 df.at[i, 'Pos'] = final_pos
-                
                 if final_pos == '1':
                     df.at[i, 'Result'] = 'Winner'
                     odds = pd.to_numeric(row.get('Odds', 1), errors='coerce') or 1
                     df.at[i, 'P/L'] = odds - 1
-                elif final_pos in ['2', '3', '4', '5', '6', '7', '8', '9', '10', '0', 'PU', 'F', 'UR', 'DSQ']:
+                else:
                     df.at[i, 'Result'] = 'Loser'
                     df.at[i, 'P/L'] = -1.0
-                
                 match_count += 1
+            else:
+                mismatch_details.append(f"❓ No match for **{row.get('Horse')}** at {row.get('Course')} (Key: `{lookup_key}`)")
 
     if match_count > 0:
         conn.update(spreadsheet=GSHEET_URL, data=df)
         st.sidebar.success(f"✅ Settled {match_count} bets!")
         st.rerun()
     else:
-        st.sidebar.warning("No matches found for Pending bets.")
+        st.sidebar.warning("No matches found.")
+        with st.expander("🔍 Why did reconciliation fail?"):
+            st.write("The script checked the API results but couldn't find matches for these 'Pending' bets:")
+            for item in mismatch_details:
+                st.write(item)
+            st.markdown("---")
+            st.write("### API Data Sample")
+            st.write("The API is providing these keys (Course|Horse):")
+            st.write(api_sample_keys[:15])
+            st.info("If the names above look different from your ledger (e.g., 'Kempton Park' vs 'Kempton'), that is the cause.")
 
 # --- 4. SIDEBAR DASHBOARD ---
 st.sidebar.header("📊 Performance Dashboard")
@@ -114,31 +136,26 @@ def display_sidebar_stats(s_val):
         st.sidebar.markdown("---")
         st.sidebar.subheader("🔄 Reconcile Results")
         
-        # MANUAL UPLOAD
         uploaded_file = st.sidebar.file_uploader("Upload Results JSON", type=["json"])
         if uploaded_file and st.sidebar.button("🚀 Sync Uploaded File"):
             process_reconciliation(json.load(uploaded_file))
         
         st.sidebar.markdown("OR")
         
-        # AUTO RECONCILE (Date Specific)
-        if st.sidebar.button("🔄 Auto Reconcile (Yesterday & Today)"):
+        if st.sidebar.button("🔄 Auto Reconcile (Last 48 Hours)"):
             auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
-            dates_to_check = [
-                datetime.now().strftime("%Y-%m-%d"),
-                (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            ]
-            
-            combined_results = {"results": []}
-            for d in dates_to_check:
-                r = requests.get(f"https://api.theracingapi.com/v1/results/standard?date={d}", auth=auth)
+            combined_data = {"results": []}
+            # Specifically check Today and Yesterday standard results
+            for days_ago in [0, 1]:
+                date_str = (datetime.now() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+                r = requests.get(f"https://api.theracingapi.com/v1/results/standard?date={date_str}", auth=auth)
                 if r.status_code == 200:
-                    combined_results["results"].extend(r.json().get('results', []))
+                    combined_data["results"].extend(r.json().get('results', []))
             
-            if combined_results["results"]:
-                process_reconciliation(combined_results)
+            if combined_data["results"]:
+                process_reconciliation(combined_data)
             else:
-                st.sidebar.error("API returned no results for these dates.")
+                st.sidebar.error("API returned no results for this period.")
     else:
         st.sidebar.info("Ledger is empty.")
 
@@ -197,7 +214,6 @@ if st.button('🚀 Run Analysis'):
                             "P/L": 0.0
                         })
 
-# SHOW TOP 3 GOLD CARDS
 if st.session_state.value_horses:
     st.markdown("### 🏆 GOLD VALUE BETS")
     top_3 = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)[:3]
