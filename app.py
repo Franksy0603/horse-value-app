@@ -50,7 +50,7 @@ def reconcile_results():
     auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
     all_winners = []
 
-    # Bypassing the 422 Archive error by using the Live results endpoint
+    # FIX: Use /live to bypass the 422 archive locking error
     r = requests.get("https://api.theracingapi.com/v1/results/live", auth=auth)
     
     if r.status_code == 200:
@@ -58,12 +58,12 @@ def reconcile_results():
         for race in results_data:
             course_name = str(race.get('course', '')).upper().strip()
             for runner in race.get('runners', []):
+                # Using 'position' as confirmed by the API data
                 if str(runner.get('position')) == '1':
                     horse_name = str(runner.get('horse', '')).upper().strip()
                     all_winners.append(f"{course_name}|{horse_name}")
     else:
-        # If live results aren't ready, we check for a custom error to explain why
-        st.sidebar.error(f"Live API unavailable (Error {r.status_code}). Results may still be processing.")
+        st.sidebar.error(f"API Error {r.status_code}. The data is currently locked for processing. Please try again in 1 hour.")
         return
 
     match_count = 0
@@ -82,6 +82,7 @@ def reconcile_results():
             else:
                 try:
                     race_date = datetime.strptime(str(row['Date']), "%Y-%m-%d").date()
+                    # Only mark as loser if the race happened before today
                     if race_date < today:
                         df.at[index, 'Result'] = 'Loser'
                         df.at[index, 'P/L'] = -1.0
@@ -94,14 +95,13 @@ def reconcile_results():
         st.sidebar.success(f"✅ Settled {match_count} bets!")
         st.rerun()
 
-# --- 4. RESTORED PERFORMANCE DASHBOARD ---
+# --- 4. PERFORMANCE DASHBOARD ---
 st.sidebar.header("📊 Performance Dashboard")
 stake_input = st.sidebar.number_input("Standard Stake (£)", min_value=1, value=10, step=1)
 
 def display_sidebar_stats(s_val):
     df = load_ledger()
     if not df.empty:
-        # Correctly calculate profit based on stakes in the ledger or current input
         df['P/L'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
         df['Stake'] = pd.to_numeric(df.get('Stake', s_val), errors='coerce').fillna(s_val)
         
@@ -126,7 +126,7 @@ def display_sidebar_stats(s_val):
 
 display_sidebar_stats(stake_input)
 
-# --- 5. DATA PROCESSING & VALUE SCORING ---
+# --- 5. DATA PROCESSING ---
 def get_best_odds(runner):
     sp_val = runner.get('sp_dec')
     if sp_val and str(sp_val).replace('.','',1).isdigit():
@@ -185,7 +185,6 @@ if st.button('🚀 Run Analysis'):
                             "P/L": 0.0
                         })
 
-# Restored "Gold Bet" Cards
 if st.session_state.value_horses:
     st.markdown("### 🏆 GOLD VALUE BETS")
     top_3 = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)[:3]
@@ -218,7 +217,6 @@ if st.session_state.value_horses:
             except Exception as e:
                 st.error(f"Logging Failed: {e}")
 
-# Restored Detailed Expander Views
 if st.session_state.all_races:
     for race in st.session_state.all_races:
         with st.expander(f"🕒 {race.get('off_time', race.get('off'))} - {race.get('course')}"):
