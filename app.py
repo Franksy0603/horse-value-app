@@ -33,7 +33,6 @@ def load_ledger():
             return conn.read(spreadsheet=GSHEET_URL, ttl=0)
         except:
             pass
-    # Default columns including the new 'Pos' field
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "Pos", "P/L"])
 
 # --- 3. SMART JSON RESULT & POSITION MATCHER ---
@@ -47,30 +46,37 @@ def upload_json_data():
             file_data = json.load(uploaded_file)
             all_positions = {} 
 
-            if isinstance(file_data, dict) and 'results' in file_data:
-                for race in file_data['results']:
-                    course_name = str(race.get('course', '')).upper().strip()
-                    for runner in race.get('runners', []):
-                        horse_name = str(runner.get('horse', '')).upper().strip()
-                        pos = str(runner.get('position', ''))
-                        # Store both course and horse to ensure unique matching
-                        all_positions[f"{course_name}|{horse_name}"] = pos
+            # Normalize and extract positions for ALL runners from JSON
+            results_list = file_data.get('results', [])
+            for race in results_list:
+                course_name = str(race.get('course', '')).strip().upper()
+                for runner in race.get('runners', []):
+                    horse_name = str(runner.get('horse', '')).strip().upper()
+                    # Capture actual position value (1, 2, PU, F, etc)
+                    pos_val = runner.get('position')
+                    if pos_val is not None:
+                        all_positions[f"{course_name}|{horse_name}"] = str(pos_val)
 
             if st.sidebar.button("🚀 Sync Positions & Results"):
                 df = load_ledger()
-                match_count = 0
                 
+                # Ensure Pos column exists in the dataframe
+                if 'Pos' not in df.columns:
+                    df['Pos'] = "-"
+                
+                match_count = 0
                 for index, row in df.iterrows():
-                    # Only update if result is still Pending or Pos is missing
+                    # Check for Pending results
                     if str(row['Result']).strip().title() == 'Pending':
-                        c_name = str(row['Course']).upper().strip()
-                        h_name = str(row['Horse']).upper().strip()
+                        c_name = str(row['Course']).strip().upper()
+                        h_name = str(row['Horse']).strip().upper()
                         lookup_key = f"{c_name}|{h_name}"
                         
                         if lookup_key in all_positions:
                             actual_pos = all_positions[lookup_key]
                             df.at[index, 'Pos'] = actual_pos
                             
+                            # Logic: Winner if Pos is 1
                             if actual_pos == '1':
                                 df.at[index, 'Result'] = 'Winner'
                                 odds = pd.to_numeric(row['Odds'], errors='coerce') or 1.0
@@ -82,8 +88,10 @@ def upload_json_data():
                 
                 if match_count > 0:
                     conn.update(spreadsheet=GSHEET_URL, data=df)
-                    st.sidebar.success(f"✅ Updated {match_count} horses!")
+                    st.sidebar.success(f"✅ Synced {match_count} positions!")
                     st.rerun()
+                else:
+                    st.sidebar.warning("No matches found. Ensure horse names match exactly.")
         except Exception as e:
             st.sidebar.error(f"JSON Error: {e}")
 
@@ -181,8 +189,9 @@ if st.session_state.value_horses:
     if st.button("📤 LOG SELECTIONS TO GOOGLE SHEETS"):
         ledger = load_ledger()
         new_df = pd.DataFrame(st.session_state.value_horses)
-        # Unique check based on Horse and Date
-        filtered = new_df[~new_df['Horse'].isin(ledger[ledger['Date'] == datetime.now().strftime("%Y-%m-%d")]['Horse'])]
+        # Check against existing entries for today
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        filtered = new_df[~new_df['Horse'].isin(ledger[ledger['Date'] == today_str]['Horse'])]
         if not filtered.empty:
             conn.update(spreadsheet=GSHEET_URL, data=pd.concat([ledger, filtered], ignore_index=True))
             st.balloons()
