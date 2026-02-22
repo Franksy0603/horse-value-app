@@ -50,7 +50,6 @@ def sync_results(json_data):
     df = load_ledger()
     if df.empty: return
     
-    # Ensure necessary columns exist
     for col in ['Pos', 'Result', 'P/L']:
         if col not in df.columns: df[col] = "-"
 
@@ -88,12 +87,12 @@ if not df_ledger.empty and 'P/L' in df_ledger.columns:
     pl = pd.to_numeric(df_ledger['P/L'], errors='coerce').fillna(0)
     stk = pd.to_numeric(df_ledger.get('Stake', stake_input), errors='coerce').fillna(stake_input)
     
-    total_prof = (pl * stk).sum()
+    total_profit = (pl * stk).sum() # Fixed Variable Name
     total_inst = stk.sum()
     roi = (total_profit / total_inst * 100) if total_inst > 0 else 0
     
-    color = "green" if total_prof >= 0 else "red"
-    st.sidebar.markdown(f"### Profit: :{color}[£{total_prof:,.2f}]")
+    color = "green" if total_profit >= 0 else "red"
+    st.sidebar.markdown(f"### Profit: :{color}[£{total_profit:,.2f}]")
     st.sidebar.metric("Invested", f"£{total_inst:,.0f}")
     st.sidebar.metric("ROI", f"{roi:.1f}%")
 
@@ -106,19 +105,17 @@ if st.sidebar.button("🔄 Auto Sync (Live)"):
     r = requests.get("https://api.theracingapi.com/v1/results/live", auth=HTTPBasicAuth(API_USER, API_PASS))
     if r.status_code == 200: sync_results(r.json())
 
-# --- 6. ANALYSIS ENGINE (Fixing the Float Error) ---
+# --- 6. ANALYSIS ENGINE ---
 def get_score(h):
     s = 0
     if str(h.get('form', '')).endswith('1'): s += 15
     t = h.get('trainer_14_days', {})
     if isinstance(t, dict):
-        # FIXED: Added fallback to '0' and safe float conversion
         try:
             percent_val = t.get('percent')
             if percent_val is not None and float(percent_val) > 15:
                 s += 10
-        except (ValueError, TypeError):
-            pass 
+        except: pass 
     return s
 
 st.sidebar.markdown("---")
@@ -130,7 +127,7 @@ if st.button('🚀 Run Analysis'):
         if r.status_code == 200:
             cards = r.json().get('racecards', [])
             
-            # Gold Bets Section
+            # Gold Bets
             all_value = []
             for race in cards:
                 for runner in race.get('runners', []):
@@ -140,7 +137,7 @@ if st.button('🚀 Run Analysis'):
             
             if all_value:
                 st.subheader("🏆 Gold Value Selections")
-                cols = st.columns(len(all_value[:4]))
+                cols = st.columns(min(len(all_value), 4))
                 for idx, v in enumerate(all_value[:4]):
                     cols[idx].metric(v['Horse'], f"Score: {v['Score']}", v['Course'])
 
