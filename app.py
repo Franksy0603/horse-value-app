@@ -37,13 +37,16 @@ def load_ledger():
         except: pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "Pos", "P/L"])
 
-# --- 3. RECONCILE LOGIC (Manual & Auto) ---
+# --- 3. RECONCILE LOGIC (Enhanced Precision) ---
 def clean_txt(text):
     if not text: return ""
-    return re.sub(r'\(.*?\)', '', str(text)).strip().upper()
+    # Removes parentheses like (AW), (IRE), (GB) and punctuation
+    t = re.sub(r'\(.*?\)', '', str(text)) 
+    t = re.sub(r'[^A-Za-z0-9\s]', '', t)
+    return " ".join(t.split()).upper().strip()
 
 def process_reconciliation(data):
-    """Processes JSON data (from API or Upload) to update the ledger."""
+    """Processes JSON data to update the ledger with positions and P/L."""
     results_map = {}
     for race in data.get('results', []):
         course = clean_txt(race.get('course', ''))
@@ -55,25 +58,27 @@ def process_reconciliation(data):
     df = load_ledger()
     if df.empty: return
 
-    # Ensure columns exist
     for col in ['Pos', 'Result', 'P/L']:
         if col not in df.columns: df[col] = "-"
 
     match_count = 0
     for i, row in df.iterrows():
-        if str(row.get('Result', '')).strip().title() == 'Pending':
+        # Look specifically for Pending rows
+        if str(row.get('Result', '')).strip().upper() == 'PENDING':
             key = f"{clean_txt(row.get('Course'))}|{clean_txt(row.get('Horse'))}"
             
             if key in results_map:
                 final_pos = results_map[key]
                 df.at[i, 'Pos'] = final_pos
+                
                 if final_pos == '1':
                     df.at[i, 'Result'] = 'Winner'
                     odds = pd.to_numeric(row.get('Odds', 1), errors='coerce') or 1
                     df.at[i, 'P/L'] = odds - 1
-                else:
+                elif final_pos in ['2', '3', '4', '5', '6', '7', '8', '9', '10', '0', 'PU', 'F', 'UR', 'DSQ']:
                     df.at[i, 'Result'] = 'Loser'
                     df.at[i, 'P/L'] = -1.0
+                
                 match_count += 1
 
     if match_count > 0:
@@ -109,20 +114,31 @@ def display_sidebar_stats(s_val):
         st.sidebar.markdown("---")
         st.sidebar.subheader("🔄 Reconcile Results")
         
-        # --- NEW: MANUAL JSON UPLOAD ---
+        # MANUAL UPLOAD
         uploaded_file = st.sidebar.file_uploader("Upload Results JSON", type=["json"])
         if uploaded_file and st.sidebar.button("🚀 Sync Uploaded File"):
             process_reconciliation(json.load(uploaded_file))
         
         st.sidebar.markdown("OR")
         
-        if st.sidebar.button("🔄 Auto Reconcile (Live API)"):
+        # AUTO RECONCILE (Date Specific)
+        if st.sidebar.button("🔄 Auto Reconcile (Yesterday & Today)"):
             auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
-            r = requests.get("https://api.theracingapi.com/v1/results/live", auth=auth)
-            if r.status_code == 200:
-                process_reconciliation(r.json())
+            dates_to_check = [
+                datetime.now().strftime("%Y-%m-%d"),
+                (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            ]
+            
+            combined_results = {"results": []}
+            for d in dates_to_check:
+                r = requests.get(f"https://api.theracingapi.com/v1/results/standard?date={d}", auth=auth)
+                if r.status_code == 200:
+                    combined_results["results"].extend(r.json().get('results', []))
+            
+            if combined_results["results"]:
+                process_reconciliation(combined_results)
             else:
-                st.sidebar.error("API currently unavailable")
+                st.sidebar.error("API returned no results for these dates.")
     else:
         st.sidebar.info("Ledger is empty.")
 
