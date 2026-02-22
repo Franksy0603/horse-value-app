@@ -88,7 +88,7 @@ def reconcile_results():
     except Exception as e:
         st.sidebar.error(f"Request failed: {e}")
 
-# --- 4. NEW: MANUAL SETTLE TOOL ---
+# --- 4. MANUAL SETTLE TOOL ---
 def manual_settle():
     st.sidebar.markdown("---")
     st.sidebar.subheader("🛠️ Manual Settle")
@@ -138,21 +138,40 @@ def display_sidebar_stats(s_val):
 
 display_sidebar_stats(stake_input)
 
-# --- 6. ANALYSIS & MAIN UI ---
-# (Keep original Data Processing and GUI logic below)
+# --- 6. DATA PROCESSING (WITH FIXES) ---
 def get_best_odds(runner):
     sp_val = runner.get('sp_dec')
     if sp_val and str(sp_val).replace('.','',1).isdigit(): return float(sp_val)
-    prices = [float(e.get('decimal')) for e in runner.get('odds', []) if str(e.get('decimal')).replace('.','',1).isdigit()]
+    prices = []
+    odds_data = runner.get('odds', [])
+    if isinstance(odds_data, list):
+        for e in odds_data:
+            val = str(e.get('decimal', '')).replace('.','',1)
+            if val.isdigit():
+                prices.append(float(e.get('decimal')))
     return max(prices) if prices else 0.0
 
 def get_score(h):
     s = 0
-    if str(h.get('form', '')).endswith('1'): s += 15
+    # Safety check for form
+    if str(h.get('form', '')).endswith('1'): 
+        s += 15
+    
+    # FIX: Robust safety check for Trainer Percentages
     t_stats = h.get('trainer_14_days', {})
-    if isinstance(t_stats, dict) and float(t_stats.get('percent', 0)) > 20: s += 15
+    if isinstance(t_stats, dict):
+        raw_val = t_stats.get('percent', 0)
+        try:
+            # Handle None or empty string values
+            if raw_val is not None and str(raw_val).strip() != "":
+                win_pc = float(raw_val)
+                if win_pc > 20: s += 15
+                elif win_pc > 10: s += 5
+        except (ValueError, TypeError):
+            pass
     return s
 
+# --- 7. MAIN INTERFACE ---
 st.sidebar.markdown("---")
 min_score = st.sidebar.slider("Min Value Score", 0, 50, 20, 5)
 
@@ -180,8 +199,17 @@ if st.session_state.value_horses:
     cols = st.columns(3)
     for i, h in enumerate(top_3):
         with cols[i]:
-            st.markdown(f'<div style="background-color:#FFD700; padding:20px; border-radius:10px; border:2px solid #DAA520; text-align:center; color:#000;"><h2>{h["Horse"]}</h2><p><b>{h["Time"]} - {h["Course"]}</b></p><hr><b>Score: {h["Score"]}</b><br>Odds: {int(h["Odds"]-1)}/1</div>', unsafe_allow_html=True)
+            st.markdown(f"""
+            <div style="background-color:#FFD700; padding:20px; border-radius:10px; border:2px solid #DAA520; text-align:center; color:#000;">
+                <h2 style="margin:0; color:#000;">{h['Horse']}</h2>
+                <p style="margin:5px 0; font-size:16px;"><b>{h['Time']} - {h['Course']}</b></p>
+                <hr style="border-top: 1px solid #DAA520;">
+                <p style="font-size:20px; margin:5px;"><b>Score: {h['Score']}</b></p>
+                <p style="font-size:18px; margin:0;">Odds: {int(h['Odds']-1) if h['Odds'] > 1 else 'SP'}/1</p>
+            </div>
+            """, unsafe_allow_html=True)
     
+    st.markdown("<br>", unsafe_allow_html=True)
     if st.button("📤 LOG ALL SELECTIONS TO GOOGLE SHEETS"):
         ledger = load_ledger()
         new_df = pd.DataFrame(st.session_state.value_horses)
