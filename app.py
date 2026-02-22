@@ -34,7 +34,7 @@ def load_ledger():
             pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "P/L"])
 
-# --- 3. RECONCILE WITH 422 ERROR HANDLING ---
+# --- 3. UPDATED RECONCILE (MATCHED TO API DATA) ---
 def reconcile_results():
     df = load_ledger()
     if df.empty:
@@ -63,22 +63,22 @@ def reconcile_results():
         if r.status_code == 200:
             results_data = r.json().get('results', [])
             for race in results_data:
+                # API uses mixed case; Ledger uses Upper. We standardize to Upper.
                 course_name = str(race.get('course', '')).upper().strip()
                 for runner in race.get('runners', []):
-                    if str(runner.get('result')) == '1':
+                    # DATA FIX: Use 'position' field instead of 'result'
+                    if str(runner.get('position')) == '1':
                         horse_name = str(runner.get('horse', '')).upper().strip()
                         all_winners.append(f"{course_name}|{horse_name}")
         elif r.status_code == 422:
-            # Handle the processing lag gracefully
-            st.sidebar.warning(f"⚠️ API results for {date_str} are still being processed. Please try again in an hour.")
+            st.sidebar.warning(f"⚠️ Results for {date_str} are still processing in the API.")
             return 
         else:
             st.sidebar.error(f"API Error {r.status_code} for {date_str}")
             return
 
-    # Only proceed if we actually successfully retrieved a list of winners
     if not all_winners:
-        st.sidebar.info("Awaiting official results...")
+        st.sidebar.info("Waiting for winners to be published to the API results...")
         return
 
     match_count = 0
@@ -114,7 +114,7 @@ stake_input = st.sidebar.number_input("Standard Stake (£)", min_value=1, value=
 def display_sidebar_stats(s_val):
     df = load_ledger()
     if not df.empty:
-        # Ensure 'Stake' column exists
+        # Check if 'Stake' exists; if not, create it
         if 'Stake' not in df.columns:
             df['Stake'] = s_val
             
@@ -202,6 +202,7 @@ if st.button('🚀 Run Analysis'):
                             "P/L": 0.0
                         })
 
+# SHOW TOP 3 GOLD CARDS
 if st.session_state.value_horses:
     st.markdown("### 🏆 GOLD VALUE BETS")
     top_3 = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)[:3]
