@@ -15,11 +15,6 @@ GSHEET_URL = st.secrets.get("gsheet_url", "")
 st.set_page_config(page_title="Value Finder Pro", layout="wide")
 st.title("🏇 Value Finder Pro: Automated Ledger")
 
-if 'value_horses' not in st.session_state:
-    st.session_state.value_horses = []
-if 'all_races' not in st.session_state:
-    st.session_state.all_races = []
-
 # --- 2. SECURE CONNECTION ---
 try:
     conn = st.connection("gsheets", type=GSheetsConnection, ttl=0)
@@ -36,18 +31,18 @@ def load_ledger():
                 df.columns = [str(c).strip() for c in df.columns]
                 for col in ["P/L", "Stake", "Odds"]:
                     if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0 if col != "Odds" else 1.0)
+                        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
                 return df
         except Exception as e:
             st.error(f"⚠️ Sheet Load Error: {e}")
     return pd.DataFrame()
 
-# --- 3. UPDATED MATCHING LOGIC ---
+# --- 3. RECONCILE LOGIC (STRONGER CLEANING) ---
 def clean_txt(text):
-    """Strips country codes, AW tags, and symbols to ensure a match."""
+    """Aggressively cleans text to force matches between Sheet and API."""
     if not text: return ""
     text = str(text).upper()
-    # Remove bracketed info like (IRE), (GB), (AW), (FR)
+    # Remove bracketed country codes and AW tags (e.g., (IRE), (AW), (GB))
     text = re.sub(r'\(.*?\)', '', text)
     # Remove common extra words that cause mismatches
     text = re.sub(r'\b(AW|PARK|CITY|JUNCTION|ESTUARY|REGIONAL|ALL WEATHER)\b', '', text)
@@ -60,7 +55,7 @@ def process_reconciliation(data):
         results_map = {}
         api_sample = []
         
-        # Build Map from JSON
+        # Build Results Map from the JSON
         for race in data.get('results', []):
             course_raw = race.get('course', '')
             course_clean = clean_txt(course_raw)
@@ -78,8 +73,9 @@ def process_reconciliation(data):
         missed_log = []
 
         for i, row in df.iterrows():
-            res_status = str(row.get('Result', '')).strip().upper()
-            if res_status in ['PENDING', '-', '']:
+            res_val = str(row.get('Result', '')).strip().upper()
+            # Only process if Result is Pending or blank
+            if res_val in ['PENDING', '-', '']:
                 l_course = clean_txt(row.get('Course'))
                 l_horse = clean_txt(row.get('Horse'))
                 lookup_key = f"{l_course}|{l_horse}"
@@ -99,21 +95,21 @@ def process_reconciliation(data):
 
         if settled_count > 0:
             conn.update(spreadsheet=GSHEET_URL, data=df)
-            st.success(f"✅ Settled {settled_count} bets!")
+            st.success(f"✅ Successfully settled {settled_count} bets!")
             st.rerun()
         else:
-            st.warning("No matches found. Check naming in Diagnostic Report.")
+            st.warning("⚠️ No matches found. Check the diagnostic report below.")
             with st.expander("🔍 Diagnostic Report"):
-                st.write("**Your Ledger (Cleaned for Match):**")
+                st.subheader("Your Ledger (Cleaned Keys)")
                 st.write(missed_log[:15])
-                st.write("**API File (Cleaned for Match):**")
+                st.subheader("API File (Cleaned Keys)")
                 st.write(api_sample[:15])
 
     except Exception as e:
         st.error(f"Reconciliation Error: {e}")
 
 # --- 4. SIDEBAR ---
-st.sidebar.header("📊 Performance Dashboard")
+st.sidebar.header("📊 Dashboard")
 stake_val = st.sidebar.number_input("Standard Stake (£)", min_value=1, value=10)
 
 def display_sidebar_stats():
@@ -123,60 +119,50 @@ def display_sidebar_stats():
             profit = (df['P/L'] * df['Stake']).sum()
             invested = df['Stake'].sum()
             color = "green" if profit >= 0 else "red"
-            st.sidebar.markdown(f"### Profit: :{color}[£{profit:,.2f}]")
+            st.sidebar.markdown(f"### Total Profit: :{color}[£{profit:,.2f}]")
             
-            c1, c2 = st.sidebar.columns(2)
-            c1.metric("Invested", f"£{invested:,.0f}")
-            roi = (profit / invested * 100) if invested > 0 else 0
-            c2.metric("ROI", f"{roi:.1f}%")
-            
+            # MANUAL RECONCILE TOOLS
             st.sidebar.markdown("---")
             st.sidebar.subheader("🔄 Reconcile")
             
             uploaded_file = st.sidebar.file_uploader("Upload Results JSON", type=["json"])
-            if uploaded_file and st.sidebar.button("🚀 Process Uploaded File"):
+            if uploaded_file and st.sidebar.button("🚀 Process Upload"):
                 process_reconciliation(json.load(uploaded_file))
 
-            if st.sidebar.button("🔄 Auto-Sync"):
+            if st.sidebar.button("🔄 Auto-Sync (Last 2 Days)"):
                 auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
                 combined = {"results": []}
                 for day in [0, 1]:
                     d_str = (datetime.now() - timedelta(days=day)).strftime("%Y-%m-%d")
                     r = requests.get(f"https://api.theracingapi.com/v1/results/standard?date={d_str}", auth=auth)
-                    if r.status_code == 200: combined["results"].extend(r.json().get('results', []))
+                    if r.status_code == 200: 
+                        combined["results"].extend(r.json().get('results', []))
                 process_reconciliation(combined)
     except Exception as e:
         st.sidebar.error(f"Stats Error: {e}")
 
 display_sidebar_stats()
 
-# --- 5 & 6. SCORING & INTERFACE (REVERTED TO WORKING VERSION) ---
-def get_best_odds(runner):
-    sp = runner.get('sp_dec')
-    if sp and str(sp).replace('.','',1).isdigit(): return float(sp)
-    prices = [float(e.get('decimal')) for e in runner.get('odds', []) if str(e.get('decimal')).replace('.','',1).isdigit()]
-    return max(prices) if prices else 0.0
-
-def get_score(h):
-    s = 0
-    if str(h.get('form', '')).endswith('1'): s += 15
-    try:
-        win_pc = float(h.get('trainer_14_days', {}).get('percent', 0))
-        if win_pc > 20: s += 15
-        elif win_pc > 10: s += 5
-    except: pass
-    return s
-
+# --- 5. INTERFACE (RESTORED CLEAN VERSION) ---
 if st.button('🚀 Run Analysis'):
-    with st.spinner("Finding value..."):
+    with st.spinner("Finding today's value..."):
         auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
         r = requests.get("https://api.theracingapi.com/v1/racecards/standard", auth=auth)
         if r.status_code == 200:
             st.session_state.all_races = r.json().get('racecards', [])
             st.session_state.value_horses = []
             for race in st.session_state.all_races:
+                # Basic Score logic
                 for r_data in race.get('runners', []):
-                    odds, score = get_best_odds(r_data), get_score(r_data)
+                    # Simplified Odds Logic
+                    sp = r_data.get('sp_dec')
+                    odds = float(sp) if sp and str(sp).replace('.','',1).isdigit() else 1.0
+                    
+                    # Score Logic
+                    score = 0
+                    if str(r_data.get('form', '')).endswith('1'): score += 15
+                    if float(r_data.get('trainer_14_days', {}).get('percent', 0)) > 15: score += 15
+                    
                     if score >= 20 and odds >= 5.0:
                         st.session_state.value_horses.append({
                             "Date": datetime.now().strftime("%Y-%m-%d"),
@@ -209,6 +195,7 @@ if st.session_state.all_races:
     for race in st.session_state.all_races:
         with st.expander(f"🕒 {race.get('course')} - {race.get('off_time', 'Race')}"):
             st.table(pd.DataFrame([{
-                "Horse": r.get('horse'), "Score": get_score(r),
-                "Odds": f"{int(get_best_odds(r)-1)}/1" if get_best_odds(r) > 1 else "SP"
+                "Horse": r.get('horse'), 
+                "Score": 15 if str(r.get('form', '')).endswith('1') else 0,
+                "Odds": r.get('sp_dec', 'SP')
             } for r in race.get('runners', [])]))
