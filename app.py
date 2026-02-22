@@ -1,5 +1,6 @@
 import streamlit as st
-import pandas as pd
+import pd as pd
+import pd
 import requests
 import json
 import re
@@ -42,36 +43,45 @@ def load_ledger():
             st.error(f"⚠️ Sheet Load Error: {e}")
     return pd.DataFrame()
 
-# --- 3. RECONCILE LOGIC ---
+# --- 3. RECONCILE LOGIC WITH DIAGNOSTICS ---
 def clean_txt(text):
     if not text: return ""
-    text = str(text).upper()
-    text = re.sub(r'\(.*?\)', '', text)
-    text = re.sub(r'\b(AW|PARK|CITY|JUNCTION|ESTUARY|REGIONAL)\b', '', text)
-    text = re.sub(r'[^A-Z0-9]', '', text)
-    return text.strip()
+    # Remove text in brackets, non-alphanumeric, and extra spaces
+    text = re.sub(r'\(.*?\)', '', str(text))
+    text = re.sub(r'[^A-Za-z0-9\s]', '', text)
+    return " ".join(text.split()).upper().strip()
 
 def process_reconciliation(data):
-    """Reconciles whatever is in the data; leaves missing races 'Pending'."""
     try:
         results_map = {}
+        api_sample = []
+        
+        # Parse JSON
         for race in data.get('results', []):
             course = clean_txt(race.get('course', ''))
             for runner in race.get('runners', []):
                 horse = clean_txt(runner.get('horse', ''))
                 key = f"{course}|{horse}"
                 results_map[key] = str(runner.get('position', ''))
+                api_sample.append(key)
 
         df = load_ledger()
-        if df.empty: return
+        if df.empty:
+            st.error("Could not load Ledger.")
+            return
 
         settled_count = 0
+        missed_matches = []
+
         for i, row in df.iterrows():
-            if str(row.get('Result', '')).strip().upper() in ['PENDING', '-', '']:
-                l_key = f"{clean_txt(row.get('Course'))}|{clean_txt(row.get('Horse'))}"
+            res_val = str(row.get('Result', '')).strip().upper()
+            if res_val in ['PENDING', '-', '']:
+                l_course = clean_txt(row.get('Course'))
+                l_horse = clean_txt(row.get('Horse'))
+                lookup_key = f"{l_course}|{l_horse}"
                 
-                if l_key in results_map:
-                    pos = results_map[l_key]
+                if lookup_key in results_map:
+                    pos = results_map[lookup_key]
                     df.at[i, 'Pos'] = pos
                     if pos == '1':
                         df.at[i, 'Result'] = 'Winner'
@@ -80,15 +90,24 @@ def process_reconciliation(data):
                         df.at[i, 'Result'] = 'Loser'
                         df.at[i, 'P/L'] = -1.0
                     settled_count += 1
+                else:
+                    missed_matches.append(lookup_key)
 
         if settled_count > 0:
             conn.update(spreadsheet=GSHEET_URL, data=df)
             st.success(f"✅ Successfully settled {settled_count} bets!")
             st.rerun()
         else:
-            st.warning("No matches found in the provided data. Rows remain 'Pending'.")
+            st.warning("⚠️ No matches found between your file and the Ledger.")
+            with st.expander("🔍 Diagnostic Report: Why did it fail?"):
+                st.write("**What your Sheet is looking for:**")
+                st.write(missed_matches[:10])
+                st.write("**What the Uploaded File contains (Sample):**")
+                st.write(api_sample[:10])
+                st.info("Check if the Course names match exactly. If your sheet says 'NEWCASTLE' and the file says 'NEWCASTLE AW', they will not match.")
+
     except Exception as e:
-        st.error(f"Reconciliation Error: {e}")
+        st.error(f"Critical error during processing: {e}")
 
 # --- 4. SIDEBAR DASHBOARD ---
 st.sidebar.header("📊 Performance Dashboard")
@@ -111,13 +130,11 @@ def display_sidebar_stats():
             st.sidebar.markdown("---")
             st.sidebar.subheader("🔄 Reconcile Results")
             
-            # MANUAL JSON UPLOAD
             uploaded_file = st.sidebar.file_uploader("Upload Results JSON", type=["json"])
             if uploaded_file:
                 if st.sidebar.button("🚀 Process Uploaded File"):
                     process_reconciliation(json.load(uploaded_file))
 
-            # AUTO SYNC BUTTON
             if st.sidebar.button("🔄 Auto-Sync (Today/Yesterday)"):
                 auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
                 combined = {"results": []}
@@ -127,13 +144,12 @@ def display_sidebar_stats():
                     if r.status_code == 200: 
                         combined["results"].extend(r.json().get('results', []))
                 process_reconciliation(combined)
-                
     except Exception as e:
         st.sidebar.error(f"Stats Error: {e}")
 
 display_sidebar_stats()
 
-# --- 5. SCORING ENGINE ---
+# --- 5 & 6. SCORING & INTERFACE ---
 def get_best_odds(runner):
     sp = runner.get('sp_dec')
     if sp and str(sp).replace('.','',1).isdigit(): return float(sp)
@@ -150,7 +166,6 @@ def get_score(h):
     except: pass
     return s
 
-# --- 6. MAIN INTERFACE ---
 if st.button('🚀 Run Analysis'):
     with st.spinner("Finding value..."):
         auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
@@ -195,7 +210,7 @@ if st.session_state.value_horses:
         if not new_df.empty:
             updated = pd.concat([ledger, new_df], ignore_index=True)
             conn.update(spreadsheet=GSHEET_URL, data=updated)
-            st.success(f"Logged {len(new_df)} new selections!")
+            st.success("Logged!")
             st.rerun()
 
 if st.session_state.all_races:
