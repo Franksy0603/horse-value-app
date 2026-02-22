@@ -53,10 +53,12 @@ def process_data_and_update(file_data):
     all_positions = {} 
     results_list = file_data.get('results', [])
     
-    # Map normalized names to positions from API data
+    # Map normalized names to positions from API/JSON data
     for race in results_list:
-        course_name = clean_name(race.get('course', ''))
+        # CLEAN COURSE NAME FROM JSON (e.g., "Chelmsford (AW)" -> "CHELMSFORD")
+        course_name = clean_name(race.get('course', '')) 
         for runner in race.get('runners', []):
+            # CLEAN HORSE NAME FROM JSON (e.g., "Fast Bullet (GB)" -> "FAST BULLET")
             horse_name = clean_name(runner.get('horse', ''))
             pos_val = runner.get('position')
             if pos_val is not None:
@@ -69,6 +71,7 @@ def process_data_and_update(file_data):
     for index, row in df.iterrows():
         # Only update if the row is still 'Pending'
         if str(row['Result']).strip().title() == 'Pending':
+            # CLEAN BOTH FROM SPREADSHEET TO ENSURE MATCH
             c_name = clean_name(row['Course'])
             h_name = clean_name(row['Horse'])
             lookup_key = f"{c_name}|{h_name}"
@@ -114,7 +117,7 @@ def display_sidebar_stats(s_val):
             c2.metric("ROI", f"{(total_money_pl / total_invested) * 100:.1f}%")
         
         st.sidebar.markdown("---")
-        # RESTORED AUTO RECONCILE
+        # AUTO RECONCILE
         if st.sidebar.button("🔄 Auto Reconcile (Live API)"):
             st.sidebar.info("Fetching live results...")
             auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
