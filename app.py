@@ -20,7 +20,7 @@ st.sidebar.header("🛡️ Strategy Settings")
 strategy_mode = st.sidebar.selectbox(
     "Staking Strategy", 
     ["Flat Stake", "80/20 Split", "Weighted Score"],
-    help="Flat: Same stake on all. 80/20: Split Win/Place. Weighted: More on high scores."
+    help="Flat: Same stake. 80/20: Split Win/Place. Weighted: More on high scores."
 )
 use_surface_boost = st.sidebar.checkbox("Apply All-Weather (AW) Boost", value=True)
 stake_input = st.sidebar.number_input("Base Stake (£)", min_value=1, value=10, step=1)
@@ -43,6 +43,10 @@ def load_ledger():
         try:
             df = conn.read(spreadsheet=GSHEET_URL, ttl=0)
             df.columns = [str(c).strip() for c in df.columns]
+            # --- FIX: Ensure new columns exist in the dataframe ---
+            for col in ["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "Pos", "P/L", "Market_Move"]:
+                if col not in df.columns:
+                    df[col] = 0.0 if col in ["P/L", "Market_Move", "Stake"] else "-"
             return df
         except: pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "Pos", "P/L", "Market_Move"])
@@ -51,9 +55,8 @@ def clean_txt(text):
     if not text: return ""
     return re.sub(r'\(.*?\)', '', str(text)).strip().upper()
 
-# --- 4. UPDATED RECONCILE LOGIC (With 80/20 & Market Move) ---
+# --- 4. ADVANCED RECONCILIATION ---
 def process_reconciliation(data):
-    """Processes JSON results to update ledger with Advanced Staking logic."""
     results_map = {}
     for race in data.get('results', []):
         course = clean_txt(race.get('course', ''))
@@ -67,10 +70,6 @@ def process_reconciliation(data):
     df = load_ledger()
     if df.empty: return
 
-    # Ensure advanced columns exist
-    for col in ['Pos', 'Result', 'P/L', 'Market_Move']:
-        if col not in df.columns: df[col] = "-"
-
     match_count = 0
     for i, row in df.iterrows():
         if str(row.get('Result', '')).strip().title() == 'Pending':
@@ -83,18 +82,14 @@ def process_reconciliation(data):
                 odds = pd.to_numeric(row.get('Odds', 1), errors='coerce') or 1
                 stake = pd.to_numeric(row.get('Stake', 10), errors='coerce') or 10
                 
-                # A. Track Closing Line Value (Market Movement)
                 df.at[i, 'Market_Move'] = round(odds - sp, 2)
                 df.at[i, 'Pos'] = final_pos
                 
-                # B. Strategy Execution
                 if strategy_mode == "80/20 Split" and odds >= 5.0:
                     place_stake = stake * 0.8
                     win_stake = stake * 0.2
-                    place_odds = ((odds - 1) / 4) + 1  # 1/4 odds place terms
-                    
-                    p_return = 0
-                    w_return = 0
+                    place_odds = ((odds - 1) / 4) + 1
+                    p_return, w_return = 0, 0
                     
                     if final_pos == '1':
                         w_return = win_stake * odds
@@ -105,10 +100,8 @@ def process_reconciliation(data):
                         df.at[i, 'Result'] = 'Placed'
                     else:
                         df.at[i, 'Result'] = 'Loser'
-                    
                     df.at[i, 'P/L'] = round((w_return + p_return) - stake, 2)
-                
-                else: # Flat/Weighted Win Logic
+                else:
                     if final_pos == '1':
                         df.at[i, 'Result'] = 'Winner'
                         df.at[i, 'P/L'] = round(odds - 1, 2)
@@ -122,15 +115,12 @@ def process_reconciliation(data):
         st.sidebar.success(f"✅ Settled {match_count} bets!")
         st.rerun()
 
-# --- 5. SCORING & STAKING ENGINES ---
+# --- 5. SCORING & STAKING ---
 def get_score(h, is_aw=False):
     s = 0
     form = str(h.get('form', ''))
     if form.endswith('1'): s += 15
-    
-    if is_aw and use_surface_boost:
-        s += 5 # Bonus for AW consistency
-        
+    if is_aw and use_surface_boost: s += 5
     t_stats = h.get('trainer_14_days', {})
     if isinstance(t_stats, dict):
         try:
@@ -153,15 +143,17 @@ def get_best_odds(runner):
     prices = [float(e.get('decimal')) for e in odds_list if str(e.get('decimal')).replace('.','',1).isdigit()]
     return max(prices) if prices else 0.0
 
-# --- 6. PERFORMANCE DASHBOARD ---
+# --- 6. PERFORMANCE DASHBOARD (Error-Proofed) ---
 st.sidebar.markdown("---")
 st.sidebar.header("📊 Stats")
 
 def display_sidebar_stats():
     df = load_ledger()
     if not df.empty:
+        # Convert to numeric safely
         df['P/L'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
         df['Stake'] = pd.to_numeric(df['Stake'], errors='coerce').fillna(10)
+        df['Market_Move'] = pd.to_numeric(df.get('Market_Move', 0), errors='coerce').fillna(0)
         
         total_profit = (df['P/L'] * df['Stake']).sum()
         roi = (total_profit / df['Stake'].sum()) * 100 if df['Stake'].sum() > 0 else 0
@@ -170,12 +162,12 @@ def display_sidebar_stats():
         st.sidebar.markdown(f"### Total Profit: :{pl_color}[£{total_profit:,.2f}]")
         st.sidebar.metric("ROI", f"{roi:.1f}%")
         
-        avg_clv = pd.to_numeric(df['Market_Move'], errors='coerce').mean()
+        avg_clv = df['Market_Move'].mean()
         st.sidebar.metric("Avg Market Move (CLV)", f"{avg_clv:+.2f}")
 
 display_sidebar_stats()
 
-# --- 7. ANALYSIS & RUN LOGIC ---
+# --- 7. RUN LOGIC ---
 st.sidebar.markdown("---")
 min_score = st.sidebar.slider("Min Value Score", 0, 50, 20, 5)
 
@@ -187,7 +179,6 @@ if st.button('🚀 Run Analysis'):
             races = r.json().get('racecards', [])
             st.session_state.all_races = races
             st.session_state.value_horses = []
-            
             for race in races:
                 is_aw = "(AW)" in race.get('course', '')
                 for r_data in race.get('runners', []):
@@ -208,7 +199,6 @@ if st.button('🚀 Run Analysis'):
                             "Market_Move": 0.0
                         })
 
-# UI: GOLD CARDS
 if st.session_state.value_horses:
     st.markdown(f"### 🏆 Top {strategy_mode} Selections")
     top_3 = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)[:3]
@@ -221,7 +211,6 @@ if st.session_state.value_horses:
                 <p style="margin:5px 0;"><b>{h['Time']} - {h['Course']}</b></p>
                 <p style="font-size:22px; margin:5px;"><b>Score: {h['Score']}</b></p>
                 <p style="font-size:18px; margin:0;">Stake: £{h['Stake']}</p>
-                <p style="font-size:14px; margin:0;">Target Odds: {h['Odds']}</p>
             </div>
             """, unsafe_allow_html=True)
 
@@ -234,9 +223,9 @@ if st.session_state.value_horses:
                 updated_df = pd.concat([ledger, filtered], ignore_index=True)
                 conn.update(spreadsheet=GSHEET_URL, data=updated_df)
                 st.balloons()
-                st.success(f"Logged {len(filtered)} bets using {strategy_mode}!")
+                st.success(f"Logged {len(filtered)} bets!")
+                st.rerun()
 
-# REST OF RACE DATA
 if st.session_state.all_races:
     for race in st.session_state.all_races:
         with st.expander(f"🕒 {race.get('off_time', race.get('off'))} - {race.get('course')}"):
@@ -248,7 +237,6 @@ if st.session_state.all_races:
                 "Value": "💎" if (get_score(r, is_aw) >= min_score and get_best_odds(r) >= 5.0) else ""
             } for r in race.get('runners', [])]))
 
-# --- RECONCILE BUTTONS ---
 st.sidebar.markdown("---")
 if st.sidebar.button("🔄 Auto Reconcile (Live API)"):
     auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
