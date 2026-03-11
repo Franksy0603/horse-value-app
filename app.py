@@ -25,7 +25,7 @@ strategy_mode = st.sidebar.selectbox(
 use_surface_boost = st.sidebar.checkbox("Apply All-Weather (AW) Boost", value=True)
 stake_input = st.sidebar.number_input("Base Stake (£)", min_value=1, value=10, step=1)
 
-# --- NEW FILTER TOGGLE ---
+# --- NEW FILTER & SLIDER ---
 st.sidebar.markdown("---")
 min_score = st.sidebar.slider("Min Value Score", 0, 50, 20, 5)
 hide_low_value = st.sidebar.checkbox("🔍 Show Value Only (Hide Others)", value=False, help="Hides all races and horses that don't meet the Min Score and Odds criteria.")
@@ -199,7 +199,7 @@ if st.button('🚀 Run Analysis'):
                             "Market_Move": 0.0
                         })
 
-# --- DISPLAY TOP PICKS ---
+# --- DISPLAY TOP PICKS (GOLDEN CARDS) ---
 if st.session_state.value_horses:
     st.markdown(f"### 🏆 Top {strategy_mode} Selections")
     top_3 = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)[:3]
@@ -227,40 +227,82 @@ if st.session_state.value_horses:
                 st.success(f"Logged {len(filtered)} bets!")
                 st.rerun()
 
-# --- 8. RACE EXPANDERS WITH FILTER LOGIC ---
+# --- 8. RACE EXPANDERS WITH ANALYSIS & FILTER ---
 if st.session_state.all_races:
     st.markdown("---")
     st.header("🏁 Racecard Details")
     
     for race in st.session_state.all_races:
         is_aw = "(AW)" in race.get('course', '')
+        runners = race.get('runners', [])
         
-        # Prepare runner data
-        runner_list = []
-        has_value = False
-        for r in race.get('runners', []):
-            score = get_score(r, is_aw)
-            odds = get_best_odds(r)
-            is_val = (score >= min_score and odds >= 5.0)
-            if is_val: has_value = True
-            
-            runner_list.append({
-                "Horse": r.get('horse'),
-                "Score": score,
-                "Odds": odds,
-                "Value": "💎" if is_val else ""
-            })
+        # Logic to check if race has a qualifying value horse
+        has_val = any((get_score(r, is_aw) >= min_score and get_best_odds(r) >= 5.0) for r in runners)
         
-        # Apply Filter Logic: Only show race if toggle is OFF OR if race has a Value horse
-        if not hide_low_value or (hide_low_value and has_value):
+        if not hide_low_value or (hide_low_value and has_val):
             with st.expander(f"🕒 {race.get('off_time', race.get('off'))} - {race.get('course')}"):
-                final_df = pd.DataFrame(runner_list)
                 
-                # If filter is ON, also hide non-value runners within the table
-                if hide_low_value:
-                    final_df = final_df[final_df['Value'] == "💎"]
-                
-                st.table(final_df)
+                # Custom Header
+                h_col1, h_col2, h_col3, h_col4, h_col5 = st.columns([3, 1, 1, 1, 3])
+                h_col1.write("**Horse**")
+                h_col2.write("**Score**")
+                h_col3.write("**Odds**")
+                h_col4.write("**Value**")
+                h_col5.write("**Analysis**")
+                st.divider()
+
+                for r in runners:
+                    score = get_score(r, is_aw)
+                    odds = get_best_odds(r)
+                    is_val = (score >= min_score and odds >= 5.0)
+                    
+                    if hide_low_value and not is_val:
+                        continue
+                    
+                    # Row Content
+                    r_col1, r_col2, r_col3, r_col4, r_col5 = st.columns([3, 1, 1, 1, 3])
+                    r_col1.write(f"**{r.get('horse')}**")
+                    r_col2.write(str(score))
+                    r_col3.write(f"{odds:.2f}")
+                    r_col4.write("💎" if is_val else "")
+
+                    # --- PROS & CONS ANALYSIS ---
+                    if is_val:
+                        with r_col5.expander("Show Reasoning"):
+                            pros = []
+                            cons = []
+                            
+                            # 1. Course/Dist Flags
+                            flags = r.get('past_results_flags', [])
+                            if 'CD' in flags: pros.append("✅ Course & Distance Winner")
+                            elif 'C' in flags: pros.append("✅ Previous Course Winner")
+                            elif 'D' in flags: pros.append("✅ Proven at this Distance")
+                            
+                            # 2. Trainer Status
+                            t_stats = r.get('trainer_14_days', {})
+                            if isinstance(t_stats, dict):
+                                win_pc = pd.to_numeric(t_stats.get('percent', 0), errors='coerce') or 0
+                                if win_pc > 20: pros.append(f"🔥 Trainer Hot Form ({win_pc}%)")
+                            
+                            # 3. Fitness Check
+                            last_run = pd.to_numeric(r.get('last_run'), errors='coerce')
+                            if not pd.isna(last_run):
+                                if last_run > 150: cons.append(f"⚠️ Long Layoff ({int(last_run)} days)")
+                                elif last_run < 10: pros.append("⚡ Quick Return (Match Fit)")
+
+                            # 4. Form Pattern
+                            form = str(r.get('form', ''))
+                            if form.endswith('1'): pros.append("🏆 Last Time Winner")
+                            if '0' in form[-2:]: cons.append("📉 Poor Recent Finish")
+                            
+                            # Display Pros
+                            for p in pros:
+                                st.markdown(f"<p style='color:green; font-size:13px; margin:0;'>{p}</p>", unsafe_allow_html=True)
+                            # Display Cons
+                            for c in cons:
+                                st.markdown(f"<p style='color:#FF4B4B; font-size:13px; margin:0;'>{c}</p>", unsafe_allow_html=True)
+                    else:
+                        r_col5.write("---")
 
 st.sidebar.markdown("---")
 if st.sidebar.button("🔄 Auto Reconcile (Live API)"):
