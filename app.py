@@ -25,6 +25,11 @@ strategy_mode = st.sidebar.selectbox(
 use_surface_boost = st.sidebar.checkbox("Apply All-Weather (AW) Boost", value=True)
 stake_input = st.sidebar.number_input("Base Stake (£)", min_value=1, value=10, step=1)
 
+# --- NEW FILTER TOGGLE ---
+st.sidebar.markdown("---")
+min_score = st.sidebar.slider("Min Value Score", 0, 50, 20, 5)
+hide_low_value = st.sidebar.checkbox("🔍 Show Value Only (Hide Others)", value=False, help="Hides all races and horses that don't meet the Min Score and Odds criteria.")
+
 if 'value_horses' not in st.session_state:
     st.session_state.value_horses = []
 if 'all_races' not in st.session_state:
@@ -43,7 +48,6 @@ def load_ledger():
         try:
             df = conn.read(spreadsheet=GSHEET_URL, ttl=0)
             df.columns = [str(c).strip() for c in df.columns]
-            # --- FIX: Ensure new columns exist in the dataframe ---
             for col in ["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "Pos", "P/L", "Market_Move"]:
                 if col not in df.columns:
                     df[col] = 0.0 if col in ["P/L", "Market_Move", "Stake"] else "-"
@@ -143,14 +147,13 @@ def get_best_odds(runner):
     prices = [float(e.get('decimal')) for e in odds_list if str(e.get('decimal')).replace('.','',1).isdigit()]
     return max(prices) if prices else 0.0
 
-# --- 6. PERFORMANCE DASHBOARD (Error-Proofed) ---
+# --- 6. PERFORMANCE DASHBOARD ---
 st.sidebar.markdown("---")
 st.sidebar.header("📊 Stats")
 
 def display_sidebar_stats():
     df = load_ledger()
     if not df.empty:
-        # Convert to numeric safely
         df['P/L'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
         df['Stake'] = pd.to_numeric(df['Stake'], errors='coerce').fillna(10)
         df['Market_Move'] = pd.to_numeric(df.get('Market_Move', 0), errors='coerce').fillna(0)
@@ -168,9 +171,6 @@ def display_sidebar_stats():
 display_sidebar_stats()
 
 # --- 7. RUN LOGIC ---
-st.sidebar.markdown("---")
-min_score = st.sidebar.slider("Min Value Score", 0, 50, 20, 5)
-
 if st.button('🚀 Run Analysis'):
     with st.spinner("Analyzing markets..."):
         auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
@@ -199,6 +199,7 @@ if st.button('🚀 Run Analysis'):
                             "Market_Move": 0.0
                         })
 
+# --- DISPLAY TOP PICKS ---
 if st.session_state.value_horses:
     st.markdown(f"### 🏆 Top {strategy_mode} Selections")
     top_3 = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)[:3]
@@ -226,16 +227,40 @@ if st.session_state.value_horses:
                 st.success(f"Logged {len(filtered)} bets!")
                 st.rerun()
 
+# --- 8. RACE EXPANDERS WITH FILTER LOGIC ---
 if st.session_state.all_races:
+    st.markdown("---")
+    st.header("🏁 Racecard Details")
+    
     for race in st.session_state.all_races:
-        with st.expander(f"🕒 {race.get('off_time', race.get('off'))} - {race.get('course')}"):
-            is_aw = "(AW)" in race.get('course', '')
-            st.table(pd.DataFrame([{
+        is_aw = "(AW)" in race.get('course', '')
+        
+        # Prepare runner data
+        runner_list = []
+        has_value = False
+        for r in race.get('runners', []):
+            score = get_score(r, is_aw)
+            odds = get_best_odds(r)
+            is_val = (score >= min_score and odds >= 5.0)
+            if is_val: has_value = True
+            
+            runner_list.append({
                 "Horse": r.get('horse'),
-                "Score": get_score(r, is_aw),
-                "Odds": get_best_odds(r),
-                "Value": "💎" if (get_score(r, is_aw) >= min_score and get_best_odds(r) >= 5.0) else ""
-            } for r in race.get('runners', [])]))
+                "Score": score,
+                "Odds": odds,
+                "Value": "💎" if is_val else ""
+            })
+        
+        # Apply Filter Logic: Only show race if toggle is OFF OR if race has a Value horse
+        if not hide_low_value or (hide_low_value and has_value):
+            with st.expander(f"🕒 {race.get('off_time', race.get('off'))} - {race.get('course')}"):
+                final_df = pd.DataFrame(runner_list)
+                
+                # If filter is ON, also hide non-value runners within the table
+                if hide_low_value:
+                    final_df = final_df[final_df['Value'] == "💎"]
+                
+                st.table(final_df)
 
 st.sidebar.markdown("---")
 if st.sidebar.button("🔄 Auto Reconcile (Live API)"):
