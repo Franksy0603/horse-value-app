@@ -30,7 +30,7 @@ stake_input = st.sidebar.number_input("Base Stake (£)", min_value=1, value=10, 
 
 st.sidebar.markdown("---")
 min_score = st.sidebar.slider("Min Value Score", 0, 50, 20, 5)
-hide_low_value = st.sidebar.checkbox("🔍 Show Value Only", value=False)
+hide_low_value = st.sidebar.checkbox("🔍 Show Value Only (Hide Others)", value=False)
 
 if 'value_horses' not in st.session_state:
     st.session_state.value_horses = []
@@ -46,13 +46,10 @@ except Exception as e:
     conn = None
 
 def load_ledger():
-    """Loads ledger and forces header consistency to prevent KeyError."""
     if conn and GSHEET_URL:
         try:
             df = conn.read(spreadsheet=GSHEET_URL, ttl=0)
-            # Force all headers to Title Case and remove hidden spaces
             df.columns = [str(c).strip().title() for c in df.columns]
-            
             required_cols = ["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "Pos", "P/L", "Market_Move"]
             for col in required_cols:
                 if col not in df.columns:
@@ -68,7 +65,29 @@ def clean_txt(text):
     text = re.sub(r'[^A-Z0-9\s]', '', text) 
     return " ".join(text.split())
 
-# --- 4. AUTO-RECONCILE LOGIC ---
+# --- 4. SCORING & UTILITY ---
+def get_score(h, is_aw=False):
+    s = 0
+    form = str(h.get('form', ''))
+    if form.endswith('1'): s += 15
+    if is_aw and use_surface_boost: s += 5
+    t_stats = h.get('trainer_14_days', {})
+    if isinstance(t_stats, dict):
+        try:
+            win_pc = pd.to_numeric(t_stats.get('percent', 0), errors='coerce') or 0
+            if win_pc > 20: s += 15
+            elif win_pc > 10: s += 5
+        except: pass
+    return s
+
+def get_best_odds(runner):
+    sp_val = runner.get('sp_dec')
+    if sp_val and str(sp_val).replace('.','',1).isdigit(): return float(sp_val)
+    odds_list = runner.get('odds', [])
+    prices = [float(e.get('decimal')) for e in odds_list if str(e.get('decimal')).replace('.','',1).isdigit()]
+    return max(prices) if prices else 0.0
+
+# --- 5. RECONCILIATION LOGIC ---
 def process_reconciliation(api_data):
     results_map = {}
     for race in api_data.get('results', []):
@@ -87,7 +106,6 @@ def process_reconciliation(api_data):
     for i, row in df.iterrows():
         if str(row.get('Result', '')).strip() == 'Pending':
             key = f"{clean_txt(row.get('Course'))}|{clean_txt(row.get('Horse'))}"
-            
             if key in results_map:
                 res = results_map[key]
                 final_pos, sp = res["pos"], res["sp"]
@@ -118,33 +136,11 @@ def process_reconciliation(api_data):
         st.sidebar.success(f"✅ Settled {match_count} bets!")
         st.rerun()
 
-# --- 5. SCORING & ANALYSIS LOGIC ---
-def get_score(h, is_aw=False):
-    s = 0
-    form = str(h.get('form', ''))
-    if form.endswith('1'): s += 15
-    if is_aw and use_surface_boost: s += 5
-    t_stats = h.get('trainer_14_days', {})
-    if isinstance(t_stats, dict):
-        try:
-            win_pc = pd.to_numeric(t_stats.get('percent', 0), errors='coerce') or 0
-            if win_pc > 20: s += 15
-            elif win_pc > 10: s += 5
-        except: pass
-    return s
-
-def get_best_odds(runner):
-    sp_val = runner.get('sp_dec')
-    if sp_val and str(sp_val).replace('.','',1).isdigit(): return float(sp_val)
-    odds_list = runner.get('odds', [])
-    prices = [float(e.get('decimal')) for e in odds_list if str(e.get('decimal')).replace('.','',1).isdigit()]
-    return max(prices) if prices else 0.0
-
 # --- 6. APP TABS ---
 tab1, tab2 = st.tabs(["🚀 Market Analysis", "📊 Ledger & Backup"])
 
 with tab1:
-    if st.button('🚀 Run Daily Analysis'):
+    if st.button('🚀 Run Analysis'):
         with st.spinner("Analyzing markets..."):
             auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
             r = requests.get(f"{BASE_URL}/racecards/standard", auth=auth)
@@ -167,7 +163,7 @@ with tab1:
                                 "Result": "Pending", "Pos": "-", "P/L": 0.0, "Market_Move": 0.0
                             })
 
-    # Show Golden Cards
+    # Golden Cards
     if st.session_state.value_horses:
         st.subheader("🏆 Top Value Selections")
         top_3 = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)[:3]
@@ -182,17 +178,49 @@ with tab1:
             new_df = pd.DataFrame(st.session_state.value_horses)
             updated_df = pd.concat([ledger, new_df[~new_df['Horse'].isin(ledger['Horse'])]], ignore_index=True)
             conn.update(spreadsheet=GSHEET_URL, data=updated_df)
-            st.success("Logged!")
+            st.balloons()
+
+    # RESTORED: Full Racecard Details Section
+    if st.session_state.all_races:
+        st.divider()
+        st.header("🏁 Racecard Details")
+        for race in st.session_state.all_races:
+            is_aw = "(AW)" in race.get('course', '')
+            runners = race.get('runners', [])
+            has_val = any((get_score(r, is_aw) >= min_score and get_best_odds(r) >= 5.0) for r in runners)
+            
+            if not hide_low_value or (hide_low_value and has_val):
+                with st.expander(f"🕒 {race.get('off_time', race.get('off'))} - {race.get('course')}"):
+                    h_col1, h_col2, h_col3, h_col4, h_col5 = st.columns([3, 1, 1, 1, 3])
+                    h_col1.write("**Horse**"); h_col2.write("**Score**"); h_col3.write("**Odds**"); h_col4.write("**Value**"); h_col5.write("**Analysis**")
+                    st.divider()
+                    for r in runners:
+                        score = get_score(r, is_aw)
+                        odds = get_best_odds(r)
+                        is_val = (score >= min_score and odds >= 5.0)
+                        if hide_low_value and not is_val: continue
+                        
+                        r_col1, r_col2, r_col3, r_col4, r_col5 = st.columns([3, 1, 1, 1, 3])
+                        r_col1.write(f"**{r.get('horse')}**")
+                        r_col2.write(str(score))
+                        r_col3.write(f"{odds:.2f}")
+                        r_col4.write("💎" if is_val else "")
+                        
+                        if is_val:
+                            with r_col5.expander("Show Reasoning"):
+                                form = str(r.get('form', ''))
+                                if form.endswith('1'): st.success("✅ Last Time Winner")
+                                t_stats = r.get('trainer_14_days', {})
+                                if isinstance(t_stats, dict) and (pd.to_numeric(t_stats.get('percent', 0), errors='coerce') or 0) > 20:
+                                    st.success("🔥 Trainer in Form")
+                                if is_aw: st.info("🌊 AW Surface Specialist")
 
 with tab2:
     ledger_df = load_ledger()
     col_l, col_r = st.columns([4, 1])
     col_l.subheader("Live Ledger")
-    
-    # DOWNLOAD BUTTON
     csv = ledger_df.to_csv(index=False).encode('utf-8')
     col_r.download_button("📥 Download CSV", csv, "ledger_backup.csv", "text/csv")
-    
     st.dataframe(ledger_df, use_container_width=True)
 
 # SIDEBAR RECONCILE
