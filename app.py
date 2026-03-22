@@ -21,8 +21,8 @@ COURSE_INFO = {
     "Doncaster": "Left", "York": "Left", "Goodwood": "Right", "Haydock": "Left"
 }
 
-st.set_page_config(page_title="Value Finder Pro V5.3", layout="wide")
-st.title("🏇 Value Finder Pro: Shrewd Selection Engine")
+st.set_page_config(page_title="Value Finder Pro V5.4", layout="wide")
+st.title("🏇 Value Finder Pro: Master Selection Engine")
 
 # --- 2. SIDEBAR ---
 st.sidebar.header("🛡️ Strategy Settings")
@@ -49,31 +49,31 @@ def load_ledger():
         except: pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "Pos", "P/L", "Market_Move"])
 
-# --- 4. THE SHREWD SCORING ENGINE ---
+# --- 4. THE MASTER SCORING ENGINE ---
 def get_advanced_score(r_data, race_data):
     s = 0
     reasons = []
     is_elite = False
     try:
-        # A. Win Form
+        # Win Form
         if str(r_data.get('form', '')).endswith('1'): 
             s += 15
             reasons.append("✅ LTO Winner")
         
-        # B. Class Drop (NEW)
+        # Class Drop
         curr_class = pd.to_numeric(race_data.get('class'), errors='coerce')
         last_class = pd.to_numeric(r_data.get('last_class'), errors='coerce')
-        if curr_class and last_class and curr_class > last_class: # Higher number = Lower Class
+        if curr_class and last_class and curr_class > last_class: 
             s += 10
             reasons.append(f"📉 Class Drop (C{int(last_class)} -> C{int(curr_class)})")
 
-        # C. First-Time Headgear (NEW)
+        # Headgear
         headgear = str(r_data.get('headgear', '')).lower()
-        if '1' in headgear: # Usually formatted as 'b1' for blinkers first time
+        if '1' in headgear:
             s += 10
             reasons.append(f"🎭 1st Time Headgear ({headgear.upper()})")
 
-        # D. Trainer Performance
+        # Trainer Performance
         t_stats = r_data.get('trainer_14_days', {})
         if isinstance(t_stats, dict):
             win_pc = pd.to_numeric(t_stats.get('percent', 0), errors='coerce') or 0
@@ -85,14 +85,14 @@ def get_advanced_score(r_data, race_data):
                 s -= 10
                 reasons.append("❄️ Trainer Cold (0% in 14d)")
 
-        # E. Elite Jockey
+        # Elite Jockey
         jky = str(r_data.get('jockey', ''))
         is_elite = any(elite in jky for elite in ELITE_JOCKEYS)
         if is_elite:
             s += 10
             reasons.append(f"🏇 Elite Jockey: {jky}")
 
-        # F. Specialist & Weight Drop
+        # Specialist & Weight
         cd_flag = str(r_data.get('cd', '')).upper()
         if 'CD' in cd_flag: s += 10; reasons.append("🎯 Course & Distance")
         
@@ -115,8 +115,8 @@ def get_safe_odds(runner):
 tab1, tab2 = st.tabs(["🚀 Market Analysis", "📊 Ledger"])
 
 with tab1:
-    if st.button('🚀 Run Shrewd Analysis'):
-        with st.spinner("Calculating class drops and trainer momentum..."):
+    if st.button('🚀 Run Analysis'):
+        with st.spinner("Compiling Shrewd Selections..."):
             auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
             r = requests.get(f"{BASE_URL}/racecards/standard", auth=auth)
             if r.status_code == 200:
@@ -142,9 +142,18 @@ with tab1:
                             })
                 st.success("Analysis Complete.")
 
-    # Top Value Selections
+    # Daily Summary Metrics
     if st.session_state.value_horses:
-        st.subheader("🎯 High-Probability Shrewd Plays")
+        st.divider()
+        m1, m2, m3 = st.columns(3)
+        total_found = len(st.session_state.value_horses)
+        triples = len([h for h in st.session_state.value_horses if h['Score'] >= 35 and h['Elite']])
+        m1.metric("Total Selections Found", total_found)
+        m2.metric("Triple Signal Plays", triples)
+        m3.metric("Avg. Selection Score", round(sum(h['Score'] for h in st.session_state.value_horses)/total_found, 1))
+
+        # Top Value Selections
+        st.subheader("🎯 High-Probability Plays")
         sorted_val = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)
         vcols = st.columns(min(len(sorted_val), 4))
         for i, h in enumerate(sorted_val[:4]):
