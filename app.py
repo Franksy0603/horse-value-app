@@ -28,7 +28,7 @@ st.sidebar.header("🛡️ Strategy Settings")
 strategy_mode = st.sidebar.selectbox("Staking Strategy", ["80/20 Split", "Flat Stake"])
 stake_input = st.sidebar.number_input("Base Stake (£)", min_value=1, value=5, step=1)
 min_score = st.sidebar.slider("Min Value Score", 0, 50, 25, 5)
-hide_low_value = st.sidebar.checkbox("🔍 Show Value Only", value=False)
+hide_low_value = st.sidebar.checkbox("🔍 Hide Non-Value Races", value=True)
 
 if 'value_horses' not in st.session_state: st.session_state.value_horses = []
 if 'all_races' not in st.session_state: st.session_state.all_races = []
@@ -55,13 +55,11 @@ def get_advanced_score(r_data, race_data):
     s = 0
     reasons = []
     try:
-        # A. Form
         form = str(r_data.get('form', ''))
         if form.endswith('1'): 
             s += 15
             reasons.append("✅ LTO Winner")
         
-        # B. Trainer
         t_stats = r_data.get('trainer_14_days', {})
         if isinstance(t_stats, dict):
             win_pc = pd.to_numeric(t_stats.get('percent', 0), errors='coerce') or 0
@@ -72,24 +70,21 @@ def get_advanced_score(r_data, race_data):
                 s += 5
                 reasons.append("📈 Trainer Form")
 
-        # C. Jockey
         jky = str(r_data.get('jockey', ''))
         if any(elite in jky for elite in ELITE_JOCKEYS):
             s += 10
             reasons.append(f"🏇 Elite Jockey: {jky}")
 
-        # D. Handicap Mark
         current_or = pd.to_numeric(r_data.get('or', 0), errors='coerce') or 0
         if 45 <= current_or <= 75:
             s += 5
             reasons.append("⚖️ Prime Handicap Mark")
 
-        # E. Surface
         if "(AW)" in str(race_data.get('course', '')):
             s += 5
             reasons.append("🌊 AW Specialist")
     except:
-        pass # Prevents one missing data point from breaking the horse
+        pass
     return s, reasons
 
 def get_safe_odds(runner):
@@ -139,12 +134,10 @@ with tab1:
     # Golden Selections
     if st.session_state.value_horses:
         st.subheader("🎯 High-Confidence Selections")
-        # Display top 4
         sorted_val = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)
         cols = st.columns(min(len(sorted_val), 4))
         for i, h in enumerate(sorted_val[:4]):
             with cols[i]:
-                # Golden Alert for Triple Signal
                 color = "#FFD700" if h['Score'] >= 35 else "#f0f2f6"
                 st.markdown(f"""<div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:2px solid #333; text-align:center;">
                 <h3 style='margin:0;'>{h['Horse']}</h3><b>{h['Time']} - {h['Course']}</b><br>Score: {h['Score']} | Odds: {h['Odds']}</div>""", unsafe_allow_html=True)
@@ -163,22 +156,35 @@ with tab1:
             conn.update(spreadsheet=GSHEET_URL, data=updated_df)
             st.balloons()
 
-    # Detailed Racecards
+    # Detailed Racecards (WITH UPDATED FILTER)
     if st.session_state.all_races:
         st.divider()
         st.header("🏁 Detailed Race Analysis")
+        
+        filtered_count = 0
         for race in st.session_state.all_races:
+            # CHECK: Does this race have any value horses?
+            runners = race.get('runners', [])
+            value_in_race = [r for r in runners if (get_advanced_score(r, race)[0] >= min_score and get_safe_odds(r) >= 5.0)]
+            
+            # If "Hide Non-Value Races" is checked and no value horse found, skip the whole expander
+            if hide_low_value and not value_in_race:
+                continue
+            
+            filtered_count += 1
             course = race.get('course', '')
             direction = next((v for k, v in COURSE_INFO.items() if k in course), "Straight/Unknown")
             
             with st.expander(f"🕒 {race.get('off_time')} - {course} ({direction})"):
-                for r in race.get('runners', []):
+                for r in runners:
                     score, reasons = get_advanced_score(r, race)
                     odds = get_safe_odds(r)
                     is_val = (score >= min_score and odds >= 5.0)
                     
-                    if hide_low_value and not is_val: continue
-                    
+                    # Inside the expander, we can still hide individual junk horses if needed
+                    if hide_low_value and not is_val:
+                        continue
+                        
                     c1, c2, c3, c4 = st.columns([2, 1, 1, 3])
                     c1.write(f"**{r.get('horse')}**")
                     c2.write(f"Score: {score}")
@@ -188,6 +194,9 @@ with tab1:
                         c4.write("💎 **VALUE** | " + " | ".join(reasons))
                     elif reasons:
                         c4.caption("Signals: " + " | ".join(reasons))
+        
+        if filtered_count == 0:
+            st.info("No races found matching your current Value Score filter.")
 
 with tab2:
     ledger_df = load_ledger()
