@@ -21,8 +21,8 @@ COURSE_INFO = {
     "Doncaster": "Left", "York": "Left", "Goodwood": "Right", "Haydock": "Left"
 }
 
-st.set_page_config(page_title="Value Finder Pro V5.4", layout="wide")
-st.title("🏇 Value Finder Pro: Master Selection Engine")
+st.set_page_config(page_title="Value Finder Pro V5.5", layout="wide")
+st.title("🏇 Value Finder Pro: Exchange Pivot Edition")
 
 # --- 2. SIDEBAR ---
 st.sidebar.header("🛡️ Strategy Settings")
@@ -30,6 +30,17 @@ race_filter = st.sidebar.selectbox("Race Type Filter", ["Handicaps Only", "All R
 stake_input = st.sidebar.number_input("Base Stake (£)", min_value=1, value=5, step=1)
 min_score = st.sidebar.slider("Min Value Score", 0, 60, 25, 5)
 hide_low_value = st.sidebar.checkbox("🔍 Hide Non-Value Races", value=True)
+
+# New Sidebar Tool
+st.sidebar.divider()
+st.sidebar.subheader("🧮 Place Value Calculator")
+calc_win_odds = st.sidebar.number_input("Current Win Odds", value=10.0)
+est_place = ((calc_win_odds - 1) / 5) + 1
+st.sidebar.caption(f"Standard Bookie Place Odds: {est_place:.2f}")
+if est_place < 1.8:
+    st.sidebar.error("⚠️ Low Place Value: High Risk/Low Reward")
+else:
+    st.sidebar.success("✅ Solid Place Value Potential")
 
 if 'value_horses' not in st.session_state: st.session_state.value_horses = []
 if 'all_races' not in st.session_state: st.session_state.all_races = []
@@ -132,13 +143,19 @@ with tab1:
                         score, reasons, is_elite = get_advanced_score(r_data, race)
                         odds = get_safe_odds(r_data)
                         if score >= min_score and odds >= 5.0:
+                            # PLACE VALUE CALC
+                            place_odds = ((odds - 1) / 5) + 1
                             st.session_state.value_horses.append({
                                 "Date": datetime.now().strftime("%Y-%m-%d"),
                                 "Horse": r_data.get('horse'),
                                 "Course": race.get('course'),
                                 "Time": race.get('off_time', 'N/A'),
-                                "Odds": odds, "Score": score, "Stake": stake_input,
-                                "Analysis": reasons, "Elite": is_elite
+                                "Odds": odds, 
+                                "Place_Odds": round(place_odds, 2),
+                                "Score": score, 
+                                "Stake": stake_input,
+                                "Analysis": reasons, 
+                                "Elite": is_elite
                             })
                 st.success("Analysis Complete.")
 
@@ -160,13 +177,20 @@ with tab1:
             with vcols[i]:
                 is_triple = h['Score'] >= 35 and h['Elite']
                 color = "#FFD700" if is_triple else "#f0f2f6"
+                
+                # Logic for the "Value Warning"
+                place_alert = ""
+                if h['Place_Odds'] < 1.8:
+                    place_alert = "<br><span style='color:red;'>⚠️ Low Place Value</span>"
+                
                 st.markdown(f"""<div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:2px solid #333; text-align:center;">
-                <h2 style='margin:0;'>{h['Horse']}</h2><b>{h['Time']} - {h['Course']}</b><br>Score: {h['Score']} | Odds: {h['Odds']}
+                <h2 style='margin:0;'>{h['Horse']}</h2><b>{h['Time']} - {h['Course']}</b><br>Score: {h['Score']} | Win: {h['Odds']} | Place: {h['Place_Odds']}
+                {place_alert}
                 {"<br>⭐ <b>TRIPLE SIGNAL</b>" if is_triple else ""}</div>""", unsafe_allow_html=True)
         
         if st.button("📤 LOG SELECTIONS"):
             ledger = load_ledger()
-            log_data = [{k: v for k, v in h.items() if k not in ['Analysis', 'Elite']} for h in st.session_state.value_horses]
+            log_data = [{k: v for k, v in h.items() if k not in ['Analysis', 'Elite', 'Place_Odds']} for h in st.session_state.value_horses]
             new_df = pd.DataFrame(log_data)
             for col in ["Result", "Pos", "P/L", "Market_Move"]: new_df[col] = "Pending" if col == "Result" else 0.0
             updated_df = pd.concat([ledger, new_df[~new_df['Horse'].isin(ledger['Horse'])]], ignore_index=True)
@@ -192,14 +216,18 @@ with tab1:
                 for r in runners:
                     score, reasons, is_elite = get_advanced_score(r, race)
                     odds = get_safe_odds(r)
+                    p_odds = round(((odds - 1) / 5) + 1, 2)
                     is_val = (score >= min_score and odds >= 5.0)
                     if hide_low_value and not is_val: continue
                     
                     c1, c2, c3, c4 = st.columns([2, 1, 1, 3])
                     c1.write(f"**{r.get('horse')}**")
                     c2.write(f"Score: {score}")
-                    c3.write(f"Odds: {odds}")
-                    if is_val: c4.write("💎 **VALUE** | " + " | ".join(reasons))
+                    c3.write(f"Win: {odds} | Pl: {p_odds}")
+                    if is_val: 
+                        val_text = "💎 **VALUE**"
+                        if p_odds < 1.8: val_text += " (⚠️ Place Poor)"
+                        c4.write(val_text + " | " + " | ".join(reasons))
                     elif reasons: c4.caption(" | ".join(reasons))
         if f_count == 0: st.info("No races match filters.")
 
