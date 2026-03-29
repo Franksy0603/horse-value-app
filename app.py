@@ -21,8 +21,8 @@ COURSE_INFO = {
     "Doncaster": "Left", "York": "Left", "Goodwood": "Right", "Haydock": "Left"
 }
 
-st.set_page_config(page_title="Value Finder Pro V5.6.2", layout="wide")
-st.title("🏇 Value Finder Pro: Bankroll Shield")
+st.set_page_config(page_title="Value Finder Pro V5.7", layout="wide")
+st.title("🏇 Value Finder Pro: Master Insights")
 
 # --- 2. SIDEBAR ---
 st.sidebar.header("🛡️ Strategy Settings")
@@ -32,7 +32,7 @@ min_score = st.sidebar.slider("Min Value Score", 0, 60, 25, 5)
 
 st.sidebar.divider()
 st.sidebar.subheader("💎 Value Protection")
-min_place_return = st.sidebar.checkbox("🚀 Enable Bankroll Shield", value=True, help="Only shows horses where Place Odds >= 2.0")
+min_place_return = st.sidebar.checkbox("🚀 Enable Bankroll Shield", value=True)
 hide_low_value = st.sidebar.checkbox("🔍 Hide Non-Value Races", value=True)
 
 if 'value_horses' not in st.session_state: st.session_state.value_horses = []
@@ -51,7 +51,6 @@ def load_ledger():
             df.columns = [str(c).strip().title() for c in df.columns]
             return df
         except: pass
-    # Default columns if sheet fails to load (Now 12 columns)
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Place_Odds", "Stake", "Result", "Pos", "P/L", "Market_Move"])
 
 # --- 4. THE MASTER SCORING ENGINE ---
@@ -114,7 +113,7 @@ tab1, tab2 = st.tabs(["🚀 Market Analysis", "📊 Ledger"])
 
 with tab1:
     if st.button('🚀 Run Analysis'):
-        with st.spinner("Analyzing markets..."):
+        with st.spinner("Analyzing markets and applying shields..."):
             auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
             r = requests.get(f"{BASE_URL}/racecards/standard", auth=auth)
             if r.status_code == 200:
@@ -131,6 +130,7 @@ with tab1:
                         odds = get_safe_odds(r_data)
                         p_odds = ((odds - 1) / 5) + 1
                         
+                        # Bankroll Shield Logic
                         if min_place_return and p_odds < 2.0: continue
                         
                         if score >= min_score and odds >= 5.0:
@@ -143,7 +143,7 @@ with tab1:
                                 "Score": score, 
                                 "Place_Odds": round(p_odds, 2),
                                 "Stake": stake_input,
-                                "Analysis": reasons, 
+                                "Analysis": reasons, # Restored reasons
                                 "Elite": is_elite
                             })
                 st.success("Analysis Complete.")
@@ -159,28 +159,21 @@ with tab1:
                 color = "#FFD700" if is_triple else "#f0f2f6"
                 st.markdown(f"""<div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:2px solid #333; text-align:center;">
                 <h2 style='margin:0;'>{h['Horse']}</h2><b>{h['Time']} - {h['Course']}</b><br>Score: {h['Score']} | Win: {h['Odds']} | Place: {h['Place_Odds']}
+                <br><small>{' | '.join(h['Analysis'])}</small>
                 {"<br>⭐ <b>TRIPLE SIGNAL</b>" if is_triple else ""}</div>""", unsafe_allow_html=True)
         
-        # --- UPDATED LOGGING SECTION (12 COLUMNS) ---
         if st.button("📤 LOG SELECTIONS"):
             ledger = load_ledger()
             log_data = []
             for h in st.session_state.value_horses:
                 log_data.append({
-                    "Date": h["Date"],
-                    "Horse": h["Horse"],
-                    "Course": h["Course"],
-                    "Time": h["Time"],
-                    "Odds": h["Odds"],
-                    "Score": h["Score"],
-                    "Place_Odds": h["Place_Odds"],
-                    "Stake": h["Stake"]
+                    "Date": h["Date"], "Horse": h["Horse"], "Course": h["Course"],
+                    "Time": h["Time"], "Odds": h["Odds"], "Score": h["Score"],
+                    "Place_Odds": h["Place_Odds"], "Stake": h["Stake"]
                 })
-            
             new_df = pd.DataFrame(log_data)
             for col in ["Result", "Pos", "P/L", "Market_Move"]:
                 new_df[col] = "Pending" if col == "Result" else 0.0
-            
             updated_df = pd.concat([ledger, new_df[~new_df['Horse'].isin(ledger['Horse'])]], ignore_index=True)
             conn.update(spreadsheet=GSHEET_URL, data=updated_df)
             st.balloons()
@@ -188,17 +181,42 @@ with tab1:
     if st.session_state.all_races:
         st.divider()
         st.header("🏁 Detailed Race Analysis")
+        f_count = 0
         for race in st.session_state.all_races:
             is_hcap = "Handicap" in str(race.get('race_name', ''))
             if race_filter == "Handicaps Only" and not is_hcap: continue
             
-            runners = race.get('runners', [])
-            with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')}"):
-                for r in runners:
-                    score, reasons, _ = get_advanced_score(r, race)
-                    odds = get_safe_odds(r)
-                    p_odds = round(((odds - 1) / 5) + 1, 2)
-                    st.write(f"**{r.get('horse')}** | Score: {score} | Win: {odds} | Place: {p_odds}")
+            # --- FIXED FILTER LOGIC ---
+            # Determine if this specific race has ANY runners that pass the filters
+            valid_in_race = []
+            for r in race.get('runners', []):
+                s, reasons, e = get_advanced_score(r, race)
+                o = get_safe_odds(r)
+                p = ((o - 1) / 5) + 1
+                if s >= min_score and o >= 5.0 and (not min_place_return or p >= 2.0):
+                    valid_in_race.append({'r': r, 's': s, 'o': o, 'p': p, 'reasons': reasons})
+
+            if hide_low_value and not valid_in_race: continue
+            
+            f_count += 1
+            direction = next((v for k, v in COURSE_INFO.items() if k in str(race.get('course'))), "Straight")
+            with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')} ({direction})"):
+                # Show all runners, but highlight the valid ones
+                for r in race.get('runners', []):
+                    s, reasons, e = get_advanced_score(r, race)
+                    o = get_safe_odds(r)
+                    p_odds = round(((o - 1) / 5) + 1, 2)
+                    is_val = any(v['r']['horse'] == r.get('horse') for v in valid_in_race)
+                    
+                    if hide_low_value and not is_val: continue
+                    
+                    c1, c2, c3, c4 = st.columns([2, 1, 1, 3])
+                    c1.write(f"**{r.get('horse')}**")
+                    c2.write(f"Score: {s}")
+                    c3.write(f"W: {o} | P: {p_odds}")
+                    if is_val: c4.write("💎 **PRO VALUE** | " + " | ".join(reasons))
+                    elif reasons: c4.caption(" | ".join(reasons))
+        if f_count == 0: st.info("No races match your combined Score and Bankroll Shield filters.")
 
 with tab2:
     st.subheader("Performance Ledger")
