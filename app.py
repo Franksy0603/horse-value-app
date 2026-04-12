@@ -1,201 +1,112 @@
 import streamlit as st
 import pandas as pd
 import requests
-import re
 from requests.auth import HTTPBasicAuth
-from datetime import datetime
 from streamlit_gsheets import GSheetsConnection
 
-# --- 1. SETTINGS & DATA MAPS ---
+# --- 1. CONFIGURATION ---
 API_USER = st.secrets.get("API_USER", "")
 API_PASS = st.secrets.get("API_PASS", "")
 GSHEET_URL = st.secrets.get("gsheet_url", "")
 BASE_URL = "https://api.theracingapi.com/v1"
 
-ELITE_JOCKEYS = ["W Buick", "O Murphy", "J Doyle", "R Moore", "T Marquand", "H Doyle", "B Curtis", "L Morris"]
+JUMPS_TRACKS = ["AINTREE", "ASCOT", "AYR", "CHELTENHAM", "HAYDOCK", "KEMPTON", "PUNCHESTOWN", "FAIRYHOUSE", "WETHERBY", "KELSO", "MUSSELBURGH", "UTTOXETER"]
 
-st.set_page_config(page_title="Value Finder Pro V5.8", layout="wide")
-st.title("🏇 Value Finder Pro: Strategy Pivot")
+st.set_page_config(page_title="Value Finder Pro V6.0", layout="wide")
 
-# --- 2. SIDEBAR ---
+# --- 2. DATA ENGINES ---
+def get_race_category(race):
+    surface = str(race.get('surface', '')).upper()
+    course = str(race.get('course', '')).upper()
+    is_jumps = str(race.get('jumps', '')).strip() != ""
+    if "AW" in surface or "DUNDALK" in course or "WOLVERHAMPTON" in course:
+        return "Flat (AW)"
+    elif is_jumps or any(j in course for j in JUMPS_TRACKS):
+        return "Jumps"
+    return "Flat (Turf)"
+
+def load_live_stats():
+    try:
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        df = conn.read(spreadsheet=GSHEET_URL)
+        # Classification for stats
+        df['Type'] = df['Course'].apply(lambda x: "Flat (AW)" if "AW" in str(x).upper() else ("Jumps" if any(j in str(x).upper() for j in JUMPS_TRACKS) else "Flat (Turf)"))
+        df['P/L'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
+        stats = df.groupby('Type')['P/L'].sum()
+        return stats
+    except:
+        return None
+
+# --- 3. HEADER & LIVE TRACKER ---
+st.title("🏇 Value Finder Pro V6.0")
+
+stats = load_live_stats()
+if stats is not None:
+    st.subheader("📊 Live Pot-Building Progress")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("All-Weather P/L", f"£{stats.get('Flat (AW)', 0):.2f}", delta="Reliability Engine")
+    m2.metric("Jumps P/L", f"£{stats.get('Jumps', 0):.2f}", delta="High Value Hunt")
+    m3.metric("Turf P/L", f"£{stats.get('Flat (Turf)', 0):.2f}")
+    st.divider()
+
+# --- 4. SIDEBAR ---
 st.sidebar.header("🛡️ Strategy Settings")
-race_filter = st.sidebar.selectbox("Race Type Filter", ["Handicaps Only", "All Race Types"], index=0)
-stake_input = st.sidebar.number_input("Base Stake (£)", min_value=1, value=5, step=1)
-# Defaulted to 30 for better ROI
+code_filter = st.sidebar.selectbox("Filter by Code", ["All Codes", "Flat (AW)", "Jumps", "Flat (Turf)"])
 min_score = st.sidebar.slider("Min Value Score", 0, 60, 30, 5)
+stake_input = st.sidebar.number_input("Total Stake (£)", value=5)
 
-st.sidebar.divider()
-st.sidebar.subheader("💎 Value Protection")
-min_place_return = st.sidebar.checkbox("🚀 Enable Bankroll Shield", value=True)
-hide_low_value = st.sidebar.checkbox("🔍 Hide Non-Value Races", value=True)
-
-if 'value_horses' not in st.session_state: st.session_state.value_horses = []
-if 'all_races' not in st.session_state: st.session_state.all_races = []
-
-# --- 3. DATABASE CONNECTION ---
-try:
-    conn = st.connection("gsheets", type=GSheetsConnection, ttl=0)
-except:
-    conn = None
-
-def load_ledger():
-    if conn and GSHEET_URL:
-        try:
-            df = conn.read(spreadsheet=GSHEET_URL, ttl=0)
-            df.columns = [str(c).strip().title() for c in df.columns]
-            return df
-        except: pass
-    return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Place_Odds", "Stake", "Result", "Pos", "P/L", "Market_Move"])
-
-# --- 4. THE MASTER SCORING ENGINE ---
-def get_advanced_score(r_data, race_data):
-    s = 0
-    reasons = []
-    is_elite = False
-    try:
-        if str(r_data.get('form', '')).endswith('1'): 
-            s += 15
-            reasons.append("✅ LTO Winner")
+# --- 5. MAIN ANALYSIS ---
+if st.button('🚀 Run Analysis'):
+    with st.spinner("Calculating Value vs. Reliability..."):
+        auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
+        r = requests.get(f"{BASE_URL}/racecards/standard", auth=auth)
         
-        curr_class = pd.to_numeric(race_data.get('class'), errors='coerce')
-        last_class = pd.to_numeric(r_data.get('last_class'), errors='coerce')
-        if curr_class and last_class and curr_class > last_class: 
-            s += 10
-            reasons.append(f"📉 Class Drop")
-
-        headgear = str(r_data.get('headgear', '')).lower()
-        if '1' in headgear:
-            s += 10
-            reasons.append(f"🎭 1st Headgear")
-
-        t_stats = r_data.get('trainer_14_days', {})
-        if isinstance(t_stats, dict):
-            win_pc = pd.to_numeric(t_stats.get('percent', 0), errors='coerce') or 0
-            if win_pc >= 20: 
-                s += 15
-                reasons.append(f"🔥 Trainer Hot")
-
-        jky = str(r_data.get('jockey', ''))
-        is_elite = any(elite in jky for elite in ELITE_JOCKEYS)
-        if is_elite:
-            s += 10
-            reasons.append(f"🏇 Elite Jockey")
-
-        cd_flag = str(r_data.get('cd', '')).upper()
-        if 'CD' in cd_flag: s += 10; reasons.append("🎯 C&D")
-    except: pass
-    return s, reasons, is_elite
-
-def get_safe_odds(runner):
-    try:
-        val = runner.get('sp_dec') or (runner.get('odds', [{}])[0].get('decimal'))
-        num = pd.to_numeric(val, errors='coerce')
-        return float(num) if num and num > 0 else 1.0
-    except: return 1.0
-
-# --- 5. INTERFACE ---
-tab1, tab2 = st.tabs(["🚀 Market Analysis", "📊 Ledger"])
-
-with tab1:
-    if st.button('🚀 Run Analysis'):
-        with st.spinner("Calculating Strategy Pivots..."):
-            auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
-            r = requests.get(f"{BASE_URL}/racecards/standard", auth=auth)
-            if r.status_code == 200:
-                data = r.json()
-                st.session_state.all_races = data.get('racecards', [])
-                st.session_state.value_horses = []
+        if r.status_code == 200:
+            selections = []
+            for race in r.json().get('racecards', []):
+                cat = get_race_category(race)
+                if code_filter != "All Codes" and cat != code_filter: continue
                 
-                for race in st.session_state.all_races:
-                    is_hcap = "Handicap" in str(race.get('race_name', ''))
-                    if race_filter == "Handicaps Only" and not is_hcap: continue
-                        
-                    for r_data in race.get('runners', []):
-                        score, reasons, is_elite = get_advanced_score(r_data, race)
-                        odds = get_safe_odds(r_data)
-                        p_odds = ((odds - 1) / 4) + 1 # Calculation for Top 4 (1/4 odds)
-                        
-                        if score >= min_score and odds >= 5.0:
-                            st.session_state.value_horses.append({
-                                "Date": datetime.now().strftime("%Y-%m-%d"),
-                                "Horse": r_data.get('horse'),
-                                "Course": race.get('course'),
-                                "Time": race.get('off_time', 'N/A'),
-                                "Odds": odds, 
-                                "Score": score, 
-                                "Place_Odds": round(p_odds, 2),
-                                "Stake": stake_input,
-                                "Analysis": reasons,
-                                "Elite": is_elite
-                            })
-                st.success("Analysis Complete.")
+                for r_data in race.get('runners', []):
+                    # Scoring Logic
+                    score = 0
+                    if str(r_data.get('form', '')).endswith('1'): score += 15
+                    if r_data.get('trainer_14_days', {}).get('percent', 0) >= 20: score += 15
+                    
+                    odds = float(r_data.get('sp_dec') or 1.0)
+                    p_odds = round(((odds - 1) / 4) + 1, 2)
+                    
+                    if score >= min_score and odds >= 5.0:
+                        selections.append({
+                            "Horse": r_data.get('horse'),
+                            "Time": race.get('off_time'),
+                            "Course": race.get('course'),
+                            "Odds": odds,
+                            "Place_Odds": p_odds,
+                            "Score": score,
+                            "Category": cat
+                        })
+            st.session_state.current_picks = selections
 
-    if st.session_state.value_horses:
-        st.divider()
-        st.subheader("🎯 Strategy-Specific Selections")
-        sorted_val = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)
-        vcols = st.columns(min(len(sorted_val), 4))
-        
-        for i, h in enumerate(sorted_val[:4]):
-            with vcols[i]:
-                # THE PIVOT LOGIC
-                if h['Place_Odds'] < 2.0:
-                    strat_label = "🥈 TOP 2 TARGET"
-                    strat_color = "#E5E4E2" # Silver
-                    advice = "Low T4 Value. Split Win/Top 2 Exchange."
-                else:
-                    strat_label = "🏆 80/20 VALUE"
-                    strat_color = "#FFD700" # Gold
-                    advice = "Good T4 odds. Standard 80/20 Bookie."
+# --- 6. SELECTION DISPLAY ---
+if 'current_picks' in st.session_state and st.session_state.current_picks:
+    st.subheader(f"🎯 Actionable Value: {code_filter}")
+    cols = st.columns(3)
+    
+    for i, res in enumerate(st.session_state.current_picks):
+        with cols[i % 3]:
+            # Strategic Labeling (The Pivot)
+            if res['Place_Odds'] < 2.0:
+                tag, color, advice = "🥈 TOP 2 TARGET", "#E5E4E2", "Low T4 Value. Use Exchange Top 2."
+            else:
+                tag, color, advice = "🏆 80/20 VALUE", "#FFD700", "Good T4 Value. Bet E/W at Bet365."
                 
-                is_triple = h['Score'] >= 35 and h['Elite']
-                border = "4px solid #000" if is_triple else "1px solid #333"
-
-                st.markdown(f"""
-                <div style="background-color:{strat_color}; padding:15px; border-radius:10px; color:#000; border:{border}; text-align:center; min-height:220px;">
-                    <h3 style='margin:0;'>{h['Horse']}</h3>
-                    <b>{h['Time']} - {h['Course']}</b><br>
-                    <hr style='margin:10px 0;'>
-                    <b style='font-size:1.1em;'>{strat_label}</b><br>
-                    Win: {h['Odds']} | Place: {h['Place_Odds']}<br>
-                    <small style='color:#333;'>{advice}</small><br>
-                    <small>{' | '.join(h['Analysis'])}</small>
-                </div>""", unsafe_allow_html=True)
-        
-        if st.button("📤 LOG SELECTIONS"):
-            ledger = load_ledger()
-            log_data = []
-            for h in st.session_state.value_horses:
-                log_data.append({
-                    "Date": h["Date"], "Horse": h["Horse"], "Course": h["Course"],
-                    "Time": h["Time"], "Odds": h["Odds"], "Score": h["Score"],
-                    "Place_Odds": h["Place_Odds"], "Stake": h["Stake"]
-                })
-            new_df = pd.DataFrame(log_data)
-            for col in ["Result", "Pos", "P/L", "Market_Move"]:
-                new_df[col] = "Pending" if col == "Result" else 0.0
-            updated_df = pd.concat([ledger, new_df[~new_df['Horse'].isin(ledger['Horse'])]], ignore_index=True)
-            conn.update(spreadsheet=GSHEET_URL, data=updated_df)
-            st.balloons()
-
-    if st.session_state.all_races:
-        st.divider()
-        st.header("🏁 Detailed Race Analysis")
-        for race in st.session_state.all_races:
-            is_hcap = "Handicap" in str(race.get('race_name', ''))
-            if race_filter == "Handicaps Only" and not is_hcap: continue
-            
-            valid_in_race = [r for r in race.get('runners', []) if get_advanced_score(r, race)[0] >= min_score and get_safe_odds(r) >= 5.0]
-            if hide_low_value and not valid_in_race: continue
-            
-            with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')}"):
-                for r in race.get('runners', []):
-                    s, reasons, _ = get_advanced_score(r, race)
-                    o = get_safe_odds(r)
-                    p = round(((o - 1) / 4) + 1, 2)
-                    if hide_low_value and (s < min_score or o < 5.0): continue
-                    st.write(f"**{r.get('horse')}** | Score: {s} | W: {o} | P: {p} | {', '.join(reasons)}")
-
-with tab2:
-    st.subheader("Performance Ledger")
-    st.dataframe(load_ledger(), use_container_width=True)
+            st.markdown(f"""
+            <div style="background-color:{color}; padding:15px; border-radius:10px; border:2px solid #333; color:black;">
+                <h3 style='margin:0;'>{res['Horse']}</h3>
+                <b>{res['Time']} - {res['Course']}</b><br>
+                <b>{tag}</b><br>
+                <hr style='margin:10px 0; border-color:black;'>
+                W: {res['Odds']} | P: {res['Place_Odds']} | Score: {res['Score']}<br>
+                <small><i>{advice}</i></small>
+            </div>""", unsafe_allow_html=True)
