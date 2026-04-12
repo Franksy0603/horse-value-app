@@ -15,9 +15,9 @@ BASE_URL = "https://api.theracingapi.com/v1"
 ELITE_JOCKEYS = ["W Buick", "O Murphy", "J Doyle", "R Moore", "T Marquand", "H Doyle", "B Curtis", "L Morris"]
 JUMPS_TRACKS = ["AINTREE", "CHELTENHAM", "PUNCHESTOWN", "FAIRYHOUSE", "KELSO", "MUSSELBURGH", "UTTOXETER", "WINCANTON", "AYR", "HAYDOCK"]
 
-st.set_page_config(page_title="Value Finder Pro V6.4", layout="wide")
+st.set_page_config(page_title="Value Finder Pro V6.6", layout="wide")
 
-# --- 2. ENHANCED DATA ENGINE ---
+# --- 2. HELPERS & CATEGORIES ---
 def get_race_category(race):
     surface = str(race.get('surface', '')).upper()
     course = str(race.get('course', '')).upper()
@@ -35,7 +35,7 @@ def get_safe_odds(runner):
         return float(num) if num and num > 0 else 1.0
     except: return 1.0
 
-# --- 3. ADVANCED ANALYTICS TRACKER ---
+# --- 3. DATABASE & ANALYTICS ---
 try:
     conn = st.connection("gsheets", type=GSheetsConnection, ttl=0)
 except:
@@ -48,9 +48,9 @@ def load_ledger():
             df.columns = [str(c).strip().title() for c in df.columns]
             return df
         except: pass
-    return pd.DataFrame()
+    return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Place_Odds", "Stake", "Result", "Pos", "P/L"])
 
-def show_advanced_tracker():
+def show_analytics():
     df = load_ledger()
     if not df.empty and 'P/L' in df.columns:
         def quick_class(c):
@@ -58,39 +58,20 @@ def show_advanced_tracker():
             if "AW" in c or "DUNDALK" in c: return "Flat (AW)"
             if any(j in c for j in JUMPS_TRACKS): return "Jumps"
             return "Flat (Turf)"
-            
         df['Type'] = df['Course'].apply(quick_class)
         df['PL_Num'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
         df['Stake_Num'] = pd.to_numeric(df['Stake'], errors='coerce').fillna(5)
-        
-        # Calculate Stats
-        stats = df.groupby('Type').agg(
-            Total_PL=('PL_Num', 'sum'),
-            Total_Stake=('Stake_Num', 'sum'),
-            Runners=('Horse', 'count'),
-            Winners=('Result', lambda x: (x.str.title() == 'Winner').sum())
-        )
-        
+        stats = df.groupby('Type').agg(Total_PL=('PL_Num', 'sum'), Total_Stake=('Stake_Num', 'sum'), Runners=('Horse', 'count'), Winners=('Result', lambda x: (x.str.title() == 'Winner').sum()))
         stats['ROI'] = (stats['Total_PL'] / stats['Total_Stake']) * 100
         stats['SR'] = (stats['Winners'] / stats['Runners']) * 100
 
-        st.subheader("📊 Performance Analytics")
+        st.subheader("📊 Live Performance Tracker")
         c1, c2, c3 = st.columns(3)
-        
-        categories = [("Flat (AW)", c1), ("Jumps", c2), ("Flat (Turf)", c3)]
-        for cat, col in categories:
+        for (cat, col) in [("Flat (AW)", c1), ("Jumps", c2), ("Flat (Turf)", c3)]:
             if cat in stats.index:
                 row = stats.loc[cat]
                 col.metric(cat, f"£{row['Total_PL']:.2f}", f"{row['ROI']:.1f}% ROI")
-                col.caption(f"🎯 Strike Rate: {row['SR']:.1f}% | 🏇 Runs: {int(row['Runners'])}")
-                
-                # Dynamic Strategic Advice
-                if row['ROI'] > 15:
-                    col.success("✅ Strategy: High Value. Stick to Win/EW.")
-                elif row['SR'] > 12:
-                    col.info("🛡️ Strategy: High SR. Use Place Only.")
-                else:
-                    col.warning("⚠️ Strategy: Low Yield. Tighten Score filter.")
+                col.caption(f"🎯 SR: {row['SR']:.1f}% | 🏇 Runs: {int(row['Runners'])}")
         st.divider()
 
 # --- 4. MASTER SCORING ENGINE ---
@@ -118,8 +99,8 @@ def get_advanced_score(r_data, race_data):
     return s, reasons
 
 # --- 5. INTERFACE ---
-st.title("🏇 Value Finder Pro V6.4")
-show_advanced_tracker()
+st.title("🏇 Value Finder Pro V6.6")
+show_analytics()
 
 tab1, tab2 = st.tabs(["🚀 Market Analysis", "📊 Ledger"])
 
@@ -136,24 +117,33 @@ enable_full_search = st.sidebar.toggle("Search All Racecards", value=False)
 hide_non_value = st.sidebar.toggle("Hide Non-Value Races", value=True)
 
 if 'value_horses' not in st.session_state: st.session_state.value_horses = []
+if 'all_races' not in st.session_state: st.session_state.all_races = []
 
 with tab1:
     if st.button('🚀 Run Analysis'):
-        with st.spinner("Processing Data..."):
+        with st.spinner("Processing Market & Places..."):
             auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
             r = requests.get(f"{BASE_URL}/racecards/standard", auth=auth)
             if r.status_code == 200:
                 data = r.json()
                 st.session_state.value_horses = []
                 st.session_state.all_races = data.get('racecards', [])
+                
                 for race in st.session_state.all_races:
                     cat = get_race_category(race)
                     if code_filter != "All Codes" and cat != code_filter: continue
                     if race_filter == "Handicaps Only" and "Handicap" not in str(race.get('race_name', '')): continue
+                    
+                    # Live Place Logic
+                    num_runners = len(race.get('runners', []))
+                    handicap = "Handicap" in str(race.get('race_name', ''))
+                    places = 2 if num_runners < 5 else (3 if num_runners < 8 else (4 if handicap and num_runners >= 16 else 3))
+
                     for r_data in race.get('runners', []):
                         score, reasons = get_advanced_score(r_data, race)
                         odds = get_safe_odds(r_data)
                         p_odds = ((odds - 1) / 4) + 1
+                        
                         if score >= min_score and odds >= 5.0:
                             st.session_state.value_horses.append({
                                 "Date": datetime.now().strftime("%Y-%m-%d"),
@@ -161,29 +151,57 @@ with tab1:
                                 "Course": race.get('course'),
                                 "Time": race.get('off_time', 'N/A'),
                                 "Odds": odds, "Score": score, "Place_Odds": round(p_odds, 2),
-                                "Stake": stake_input, "Analysis": reasons, "Category": cat
+                                "Places": places, "Category": cat, "Stake": stake_input, "Analysis": reasons
                             })
                 st.success("Analysis Complete.")
 
     if st.session_state.value_horses:
-        st.subheader("🎯 Actionable Value Selections")
+        st.subheader("🎯 Actionable Value Selection Cards")
         sorted_val = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)
         vcols = st.columns(min(len(sorted_val), 4))
+        
         for i, h in enumerate(sorted_val[:4]):
             with vcols[i]:
-                tag, color, advice = ("🥈 TOP 2 TARGET", "#E5E4E2", "Low Place Value.") if h['Place_Odds'] < 2.0 else ("🏆 80/20 VALUE", "#FFD700", "Good Each Way Value.")
-                st.markdown(f"""<div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:1px solid #333; text-align:center;">
-                    <h3 style='margin:0;'>{h['Horse']}</h3><b>{h['Time']} - {h['Course']}</b><br>
-                    <b style='font-size:1.1em;'>{tag}</b><br>W: {h['Odds']} | P: {h['Place_Odds']}<br>
-                    <small>{advice}</small></div>""", unsafe_allow_html=True)
+                is_gold = h['Place_Odds'] >= 2.0
+                tag, color = ("🏆 80/20 GOLD", "#FFD700") if is_gold else ("🥈 TOP 2 PIVOT", "#E5E4E2")
+                
+                st.markdown(f"""
+                <div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:2px solid #333; min-height:280px;">
+                    <h3 style='margin:0;'>{h['Horse']}</h3>
+                    <b>{h['Time']} - {h['Course']}</b><br>
+                    <hr style='margin:10px 0; border-color:black;'>
+                    <b style='font-size:1.1em;'>{tag}</b><br>
+                    Win: {h['Odds']} | Place: {h['Place_Odds']}<br>
+                    <b>Market:</b> Paying {h['Places']} Places<br>
+                    <div style="background-color:rgba(255,255,255,0.4); padding:5px; border-radius:5px; margin-top:10px; font-size:0.85em;">
+                        <b>ADVICE:</b> Use Bet365 <i>Each Way Extra</i> to boost to {h['Places']+1} places for security.<br>
+                        {' | '.join(h['Analysis'])}
+                    </div>
+                </div>""", unsafe_allow_html=True)
         
-        if st.button("📤 LOG SELECTIONS TO SHEETS"):
+        if st.button("📤 LOG SELECTIONS TO LEDGER"):
             ledger = load_ledger()
             new_rows = pd.DataFrame(st.session_state.value_horses)
             for col in ["Result", "Pos", "P/L", "Market_Move"]: new_rows[col] = "Pending"
             updated_df = pd.concat([ledger, new_rows], ignore_index=True).drop_duplicates(subset=['Horse', 'Date'])
             conn.update(spreadsheet=GSHEET_URL, data=updated_df)
             st.balloons()
+
+    # 🏁 DETAILED RACE BROWSER
+    if st.session_state.all_races:
+        st.divider()
+        st.header("🏁 Racecard Browser")
+        for race in st.session_state.all_races:
+            cat = get_race_category(race)
+            if code_filter != "All Codes" and cat != code_filter: continue
+            
+            with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')} ({cat})"):
+                for r in race.get('runners', []):
+                    s, reasons = get_advanced_score(r, race)
+                    o = get_safe_odds(r)
+                    is_flagged = s >= min_score and o >= 5.0
+                    style = "color: green; font-weight: bold;" if is_flagged else "color: gray;"
+                    st.markdown(f"<span style='{style}'>{r.get('horse')}</span> | Score: {s} | Odds: {o} | {', '.join(reasons)}", unsafe_allow_html=True)
 
 with tab2:
     st.dataframe(load_ledger(), use_container_width=True)
