@@ -12,14 +12,14 @@ API_PASS = st.secrets.get("API_PASS", "")
 GSHEET_URL = st.secrets.get("gsheet_url", "")
 BASE_URL = "https://api.theracingapi.com/v1"
 
-# Champion Jockeys for the "Elite Performance" Mode
+# Personnel for Elite Performance Mode
 ELITE_JOCKEYS = ["W Buick", "O Murphy", "J Doyle", "R Moore", "T Marquand", "H Doyle", "B Curtis", "L Morris"]
 
-st.set_page_config(page_title="Value Finder Pro V6.8", layout="wide")
+st.set_page_config(page_title="Value Finder Pro V6.9", layout="wide")
 
 # --- 2. THE PRECISION ENGINES ---
 def get_race_category(race):
-    """Accurately distinguishes between Jumps, AW, and Turf."""
+    """Accurately identifies race code based on API data tags."""
     is_jumps_data = race.get('jumps', '')
     race_type = str(race.get('type', '')).lower()
     surface = str(race.get('surface', '')).upper()
@@ -30,7 +30,7 @@ def get_race_category(race):
     return "Flat (Turf)"
 
 def get_safe_odds(runner):
-    """Safely extracts decimal odds."""
+    """Safely extracts decimal odds from API."""
     try:
         val = runner.get('sp_dec') or (runner.get('odds', [{}])[0].get('decimal'))
         num = pd.to_numeric(val, errors='coerce')
@@ -38,7 +38,7 @@ def get_safe_odds(runner):
     except: return 1.0
 
 def get_advanced_score(r_data, race_data):
-    """Master Scoring Engine - returns score and flags for elite personnel."""
+    """Scoring Engine - returns total score and personnel flags."""
     s = 0
     reasons = []
     is_elite_jky = False
@@ -68,6 +68,7 @@ except:
     conn = None
 
 def load_ledger():
+    """Reads the current performance from Google Sheets."""
     if conn and GSHEET_URL:
         try:
             df = conn.read(spreadsheet=GSHEET_URL, ttl=0)
@@ -76,27 +77,8 @@ def load_ledger():
         except: pass
     return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Place_Odds", "Stake", "Result", "Pos", "P/L"])
 
-def show_tracker():
-    df = load_ledger()
-    if not df.empty and 'P/L' in df.columns:
-        df['PL_Num'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
-        # Dynamic grouping for stats
-        def quick_cat(c):
-            c = str(c).upper()
-            return "Flat (AW)" if "(AW)" in c else ("Jumps" if any(j in c for j in ["KELSO", "AINTREE", "FAIRYHOUSE"]) else "Flat (Turf)")
-        df['Internal_Cat'] = df['Course'].apply(quick_cat)
-        stats = df.groupby('Internal_Cat')['PL_Num'].sum()
-        
-        st.subheader("📊 Live Pot-Building Tracker")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Flat (AW)", f"£{stats.get('Flat (AW)', 0):.2f}")
-        c2.metric("Jumps", f"£{stats.get('Jumps', 0):.2f}")
-        c3.metric("Flat (Turf)", f"£{stats.get('Flat (Turf)', 0):.2f}")
-        st.divider()
-
 # --- 4. INTERFACE ---
-st.title("🏇 Value Finder Pro V6.8")
-show_tracker()
+st.title("🏇 Value Finder Pro V6.9")
 
 tab1, tab2 = st.tabs(["🚀 Market Analysis", "📊 Ledger"])
 
@@ -107,19 +89,20 @@ app_mode = st.sidebar.radio("Active Engine:", ["Value Strategy", "Elite Performa
 st.sidebar.divider()
 st.sidebar.header("🛡️ Settings")
 code_filter = st.sidebar.selectbox("Filter by Code", ["All Codes", "Flat (AW)", "Jumps", "Flat (Turf)"])
-min_score = st.sidebar.slider("Min Value Score", 0, 60, 30 if app_mode == "Value Strategy" else 20)
+min_score = st.sidebar.slider("Min Selection Score", 0, 60, 30 if app_mode == "Value Strategy" else 20)
 stake_input = st.sidebar.number_input("Base Stake (£)", value=5)
 
 st.sidebar.divider()
-st.sidebar.subheader("🔍 Browser Tools")
-hide_non_value = st.sidebar.toggle("Hide Non-Selection Races", value=True)
+st.sidebar.subheader("🔍 Browser Settings")
+hide_non_selection = st.sidebar.toggle("Hide Races Without Picks", value=True)
 
+# Session State Initialization
 if 'value_horses' not in st.session_state: st.session_state.value_horses = []
 if 'all_races' not in st.session_state: st.session_state.all_races = []
 
 with tab1:
     if st.button('🚀 Run Analysis'):
-        with st.spinner(f"Analyzing {app_mode} picks..."):
+        with st.spinner(f"Scanning market for {app_mode}..."):
             auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
             r = requests.get(f"{BASE_URL}/racecards/standard", auth=auth)
             if r.status_code == 200:
@@ -131,7 +114,6 @@ with tab1:
                     cat = get_race_category(race)
                     if code_filter != "All Codes" and cat != code_filter: continue
                     
-                    # Place Logic
                     num_r = len(race.get('runners', []))
                     hcap = "Handicap" in str(race.get('race_name', ''))
                     places = 2 if num_r < 5 else (3 if num_r < 8 else (4 if hcap and num_r >= 16 else 3))
@@ -141,7 +123,7 @@ with tab1:
                         odds = get_safe_odds(r_data)
                         p_odds = round(((odds - 1) / 4) + 1, 2)
                         
-                        # Selection Switch
+                        # Logic switch for the two modes
                         if app_mode == "Value Strategy":
                             match = (score >= min_score and odds >= 5.0)
                             tag = "🏆 VALUE PLAY"
@@ -158,25 +140,26 @@ with tab1:
                                 "Odds": odds, "Score": score, "Place_Odds": p_odds,
                                 "Places": places, "Tag": tag, "Analysis": reasons, "Category": cat, "Stake": stake_input
                             })
-                st.success(f"Analysis Complete. Found {len(st.session_state.value_horses)} picks.")
+                st.success(f"Analysis Complete! Found {len(st.session_state.value_horses)} selections.")
 
-    # Selection Cards
+    # 🎯 DISPLAY ACTION CARDS
     if st.session_state.value_horses:
         st.subheader("🎯 Actionable Strategy Cards")
-        vcols = st.columns(min(len(st.session_state.value_horses), 4))
-        for i, h in enumerate(st.session_state.value_horses[:4]):
+        sorted_h = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)
+        vcols = st.columns(min(len(sorted_h), 4))
+        for i, h in enumerate(sorted_h[:4]):
             with vcols[i]:
                 color = "#FFD700" if "VALUE" in h['Tag'] else "#00FFCC"
                 st.markdown(f"""
-                <div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:2px solid #333; min-height:300px;">
+                <div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:2px solid #333; min-height:280px;">
                     <h3 style='margin:0;'>{h['Horse']}</h3>
-                    <b>{h['Time']} - {h['Course']}</b><br>
-                    <small>{h['Category']}</small><hr style='border-color:black;'>
-                    <b style='font-size:1.1em;'>{h['Tag']}</b><br>
+                    <b>{h['Time']} - {h['Course']}</b><br><small>{h['Category']}</small>
+                    <hr style='border-color:black;'>
+                    <b>{h['Tag']}</b><br>
                     Win: {h['Odds']} | Place: {h['Place_Odds']}<br>
-                    <b>Market:</b> Paying {h['Places']} Places<br>
-                    <div style="background-color:rgba(255,255,255,0.4); padding:5px; border-radius:5px; margin-top:10px; font-size:0.85em;">
-                        <b>ADVICE:</b> Use Bet365 <i>Each Way Extra</i> for {h['Places']+1} places.<br>
+                    <b>Paying {h['Places']} Places</b><br>
+                    <div style="background-color:rgba(255,255,255,0.4); padding:5px; border-radius:5px; margin-top:10px; font-size:0.8em;">
+                        <b>ADVICE:</b> Use Bet365 Each Way Extra for {h['Places']+1} places.<br>
                         {' | '.join(h['Analysis'])}
                     </div>
                 </div>""", unsafe_allow_html=True)
@@ -189,7 +172,7 @@ with tab1:
             conn.update(spreadsheet=GSHEET_URL, data=updated)
             st.balloons()
 
-    # Racecard Browser
+    # 🏁 THE SYNCED BROWSER
     if st.session_state.all_races:
         st.divider()
         st.header("🏁 Detailed Race Analysis")
@@ -197,16 +180,23 @@ with tab1:
             cat = get_race_category(race)
             if code_filter != "All Codes" and cat != code_filter: continue
             
-            # Selection check for "Hide" toggle
-            has_sel = any(get_advanced_score(r, race)[0] >= min_score for r in race.get('runners', []))
-            if hide_non_value and not has_sel: continue
+            # Logic: Show race if it contains ANY of our found horses
+            horse_names_in_this_race = [r.get('horse') for r in race.get('runners', [])]
+            sel_in_race = [h for h in st.session_state.value_horses if h['Horse'] in horse_names_in_this_race and h['Time'] == race.get('off_time')]
+            
+            if hide_non_selection and not sel_in_race: continue
 
             with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')} ({cat})"):
                 for r in race.get('runners', []):
                     s, reasons, is_e, is_h = get_advanced_score(r, race)
                     o = get_safe_odds(r)
-                    style = "color: green; font-weight: bold;" if (s >= min_score and o >= 5.0) else "color: gray;"
+                    
+                    # Highlight if this runner is one of our session picks
+                    is_pick = any(p['Horse'] == r.get('horse') and p['Time'] == race.get('off_time') for p in st.session_state.value_horses)
+                    style = "color: #008000; font-weight: bold; font-size: 1.1em;" if is_pick else "color: gray;"
+                    
                     st.markdown(f"<span style='{style}'>{r.get('horse')}</span> | Score: {s} | Odds: {o} | {', '.join(reasons)}", unsafe_allow_html=True)
 
 with tab2:
+    st.subheader("Performance Ledger")
     st.dataframe(load_ledger(), use_container_width=True)
