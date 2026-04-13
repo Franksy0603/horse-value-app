@@ -3,79 +3,57 @@ import pandas as pd
 import requests
 from requests.auth import HTTPBasicAuth
 from datetime import datetime
-import re
 from streamlit_gsheets import GSheetsConnection
 
-# --- 1. CONFIG & SYSTEM SETUP ---
+# --- 1. SETTINGS & CONFIG ---
 API_USER = st.secrets.get("API_USER", "")
 API_PASS = st.secrets.get("API_PASS", "")
 GSHEET_URL = st.secrets.get("gsheet_url", "")
 BASE_URL = "https://api.theracingapi.com/v1"
 
-# Pro Jockey List
-ELITE_JOCKEYS = ["W Buick", "O Murphy", "J Doyle", "R Moore", "T Marquand", "H Doyle", "B Curtis", "L Morris", "S Levey"]
+ELITE_JOCKEYS = ["W Buick", "O Murphy", "J Doyle", "R Moore", "T Marquand", "H Doyle", "B Curtis", "L Morris"]
 
-st.set_page_config(page_title="Value Finder Pro V7.5", layout="wide")
+st.set_page_config(page_title="Value Finder Pro V7.6", layout="wide")
 
-# --- 2. THE MASTER SCORING ENGINE ---
-def get_advanced_score(runner, race):
-    score = 0
+# --- 2. ENGINES ---
+def get_race_category(race):
+    is_jumps = race.get('jumps', '')
+    race_type = str(race.get('type', '')).lower()
+    surface = str(race.get('surface', '')).upper()
+    if is_jumps and len(str(is_jumps).strip()) > 0: return "Jumps"
+    if "flat" in race_type:
+        return "Flat (AW)" if ("AW" in surface or "STANDARD" in surface) else "Flat (Turf)"
+    return "Flat (Turf)"
+
+def get_advanced_score(r_data):
+    s = 0
     reasons = []
-    
-    # 1. Recent Form (Last Time Out Winner)
-    form = str(runner.get('form', ''))
-    if form.endswith('1'):
-        score += 15
-        reasons.append("✅ LTO Winner")
-    
-    # 2. Course and Distance
-    cd = str(runner.get('cd', '')).upper()
-    if 'CD' in cd:
-        score += 15
-        reasons.append("🎯 C&D Specialist")
-    elif 'C' in cd:
-        score += 7
-        reasons.append("📍 Course Winner")
-    
-    # 3. Trainer Performance (14-Day Strike Rate)
-    t_stats = runner.get('trainer_14_days', {})
-    if isinstance(t_stats, dict):
-        pct = pd.to_numeric(t_stats.get('percent', 0), errors='coerce')
-        if pct >= 20:
-            score += 15
-            reasons.append(f"🔥 Trainer Hot ({int(pct)}%)")
-        elif pct >= 15:
-            score += 8
-            reasons.append("📈 Trainer Steady")
-            
-    # 4. Elite Jockey Signal
-    jky = str(runner.get('jockey', ''))
-    if any(elite in jky for elite in ELITE_JOCKEYS):
-        score += 12
-        reasons.append("🏇 Elite Jockey")
+    is_elite, is_hot = False, False
+    try:
+        if str(r_data.get('form', '')).endswith('1'): 
+            s += 15; reasons.append("✅ LTO Winner")
+        if 'CD' in str(r_data.get('cd', '')).upper(): 
+            s += 15; reasons.append("🎯 C&D")
+        t_stats = r_data.get('trainer_14_days', {})
+        if isinstance(t_stats, dict) and pd.to_numeric(t_stats.get('percent', 0), errors='coerce') >= 20: 
+            s += 15; reasons.append("🔥 Trainer Hot"); is_hot = True
+        jky = str(r_data.get('jockey', ''))
+        if any(elite in jky for elite in ELITE_JOCKEYS):
+            s += 12; reasons.append("🏇 Elite Jockey"); is_elite = True
+    except: pass
+    return s, reasons, is_elite, is_hot
 
-    # 5. Gear Changes
-    if '1' in str(runner.get('headgear', '')):
-        score += 10
-        reasons.append("🎭 1st Time Gear")
-
-    return score, reasons
-
-# --- 3. MARKET DYNAMICS (Quants) ---
-def get_market_move(runner):
-    # Current vs Morning Price
-    curr = float(runner.get('sp_dec') or (runner.get('odds', [{}])[0].get('decimal', 1.0)))
-    morning = float(runner.get('morning_price_dec') or curr)
-    
-    if curr < morning * 0.90: return "🔥 STEAMER", "#ff4b4b"
-    if curr > morning * 1.10: return "❄️ DRIFTER", "#3399ff"
-    return "📊 STABLE", "#808495"
+def get_market_move(r_data):
+    current = float(r_data.get('sp_dec') or 1.0)
+    morning = float(r_data.get('morning_price_dec') or current)
+    if current < morning * 0.95: return "🔥 STEAMER"
+    if current > morning * 1.05: return "❄️ DRIFTER"
+    return "📊 STABLE"
 
 def get_tissue_price(score):
-    # Professional 'Tissue' formula: Odds = 100 / (Score + Confidence Factor)
     return round(100 / (score + 15), 2)
 
-# --- 4. DATA OPERATIONS (Google Sheets) ---
+# --- 3. DATA OPERATIONS ---
 try:
     conn = st.connection("gsheets", type=GSheetsConnection, ttl=0)
 except:
@@ -83,106 +61,128 @@ except:
 
 def load_ledger():
     if conn and GSHEET_URL:
-        df = conn.read(spreadsheet=GSHEET_URL, ttl=0)
-        df.columns = [str(c).strip().title() for c in df.columns]
-        return df
-    return pd.DataFrame()
+        try:
+            df = conn.read(spreadsheet=GSHEET_URL, ttl=0)
+            df.columns = [str(c).strip().title() for c in df.columns]
+            return df
+        except: pass
+    return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Result", "Pos", "P/L"])
 
-def log_to_sheets(new_data):
-    current_ledger = load_ledger()
-    updated_df = pd.concat([current_ledger, pd.DataFrame(new_data)], ignore_index=True)
-    updated_df = updated_df.drop_duplicates(subset=['Horse', 'Date', 'Time'])
-    conn.update(spreadsheet=GSHEET_URL, data=updated_df)
-    return True
+def settle_ledger():
+    ledger = load_ledger()
+    if ledger.empty: return "No data."
+    auth = HTTPBasicAuth(API_USER, API_PASS)
+    r = requests.get(f"{BASE_URL}/results", params={'date': datetime.now().strftime("%Y-%m-%d")}, auth=auth)
+    if r.status_code == 200:
+        results = r.json().get('results', [])
+        res_map = {f"{res['course'].upper()}|{run['horse'].upper()}": run for res in results for run in res.get('runners', [])}
+        updates = 0
+        for i, row in ledger.iterrows():
+            if str(row.get('Result', '')).lower() == 'pending':
+                key = f"{str(row['Course']).upper()}|{str(row['Horse']).upper()}"
+                if key in res_map:
+                    pos = res_map[key].get('position')
+                    ledger.at[i, 'Pos'] = pos
+                    ledger.at[i, 'Result'] = 'Winner' if str(pos) == '1' else 'Loser'
+                    ledger.at[i, 'P/L'] = (float(row['Odds']) - 1) if str(pos) == '1' else -1.0
+                    updates += 1
+        if updates > 0:
+            conn.update(spreadsheet=GSHEET_URL, data=ledger)
+            return f"Settled {updates} bets!"
+    return "No results found yet."
 
-# --- 5. THE APP INTERFACE ---
-st.sidebar.title("Settings & Strategy")
-app_mode = st.sidebar.radio("Selection Mode", ["Value Strategy (5.0+)", "Elite Performance (<5.0)"])
-min_score = st.sidebar.slider("Min Score Filter", 0, 70, 30)
-min_gap = st.sidebar.slider("Min Value Gap %", -100, 100, -20)
-show_all = st.sidebar.toggle("Show ALL Racecards", value=False)
+# --- 4. INTERFACE ---
+st.sidebar.header("🕹️ Strategy Mode")
+app_mode = st.sidebar.radio("Active Engine:", ["Value Strategy", "Elite Performance"])
 
-tab1, tab2 = st.tabs(["🚀 Live Market Analysis", "📊 Betting Ledger"])
+st.sidebar.divider()
+st.sidebar.header("🛡️ Settings")
+code_filter = st.sidebar.selectbox("Filter by Code", ["All Codes", "Flat (AW)", "Jumps", "Flat (Turf)"])
+min_score = st.sidebar.slider("Min Value Score", 0, 60, 30)
+min_gap = st.sidebar.slider("Min Gap % Filter", -100, 100, -20)
+
+st.sidebar.divider()
+st.sidebar.subheader("🔍 Browser Tools")
+show_all_races = st.sidebar.toggle("Show ALL Racecards", value=False)
+
+# Initialize Session States to prevent KeyError
+if 'value_horses' not in st.session_state: st.session_state.value_horses = []
+if 'all_races' not in st.session_state: st.session_state.all_races = []
+
+tab1, tab2 = st.tabs(["🚀 Market Analysis", "📊 Ledger"])
 
 with tab1:
-    if st.button("🚀 Run Full Pro Analysis"):
-        auth = HTTPBasicAuth(API_USER, API_PASS)
-        with st.spinner("Fetching Live API Data..."):
+    if st.button('🚀 Run Analysis'):
+        with st.spinner("Crunching data..."):
+            auth = HTTPBasicAuth(API_USER, API_PASS)
             r = requests.get(f"{BASE_URL}/racecards/standard", auth=auth)
             if r.status_code == 200:
-                st.session_state.races = r.json().get('racecards', [])
-                st.session_state.picks = []
+                st.session_state.all_races = r.json().get('racecards', [])
+                st.session_state.value_horses = []
                 
-                for race in st.session_state.races:
-                    for runner in race.get('runners', []):
-                        score, reasons = get_advanced_score(runner, race)
-                        odds = float(runner.get('sp_dec') or 1.0)
+                for race in st.session_state.all_races:
+                    cat = get_race_category(race)
+                    if code_filter != "All Codes" and cat != code_filter: continue
+                    
+                    for r_data in race.get('runners', []):
+                        score, reasons, is_e, is_h = get_advanced_score(r_data)
+                        odds = float(r_data.get('sp_dec') or 1.0)
                         tissue = get_tissue_price(score)
                         gap = round(((odds - tissue) / tissue) * 100, 1)
-                        move, move_color = get_market_move(runner)
                         
-                        # Selection Logic
-                        is_val = (app_mode == "Value Strategy (5.0+)" and odds >= 5.0 and score >= min_score)
-                        is_eli = (app_mode == "Elite Performance (<5.0)" and odds < 5.0 and score >= 20)
+                        is_match = (app_mode == "Value Strategy" and odds >= 5.0 and score >= min_score) or \
+                                   (app_mode == "Elite Performance" and odds < 5.0 and score >= 20)
                         
-                        if (is_val or is_eli) and gap >= min_gap:
-                            st.session_state.picks.append({
+                        if is_match and gap >= min_gap:
+                            st.session_state.value_horses.append({
                                 "Date": datetime.now().strftime("%Y-%m-%d"),
-                                "Horse": runner.get('horse'),
-                                "Course": race.get('course'),
-                                "Time": race.get('off_time'),
-                                "Odds": odds,
-                                "Score": score,
-                                "Tissue": tissue,
-                                "Gap": f"{gap}%",
-                                "Move": move,
-                                "Color": move_color,
-                                "Analysis": " | ".join(reasons),
-                                "Result": "Pending",
-                                "P/L": 0.0
+                                "Horse": r_data.get('horse'), "Course": race.get('course'),
+                                "Time": race.get('off_time'), "Odds": odds, "Score": score,
+                                "Tissue": tissue, "Gap": f"{gap}%", "Move": get_market_move(r_data),
+                                "Tag": "VALUE" if odds >= 5.0 else "BANKER", "Analysis": " | ".join(reasons)
                             })
 
-    # DISPLAY CARDS
-    if 'picks' in st.session_state and st.session_state.picks:
-        st.subheader(f"🎯 Qualifying {app_mode} Selections")
-        cols = st.columns(4)
-        for i, pick in enumerate(st.session_state.picks):
-            with cols[i % 4]:
-                st.markdown(f"""
-                <div style="border: 2px solid #333; padding: 15px; border-radius: 10px; background-color: #0e1117; margin-bottom: 10px;">
-                    <h3 style="margin:0; color:#FFD700;">{pick['Horse']}</h3>
-                    <p style="margin:0; font-size: 0.9em;">{pick['Time']} {pick['Course']}</p>
-                    <hr style="margin: 10px 0;">
-                    <b>Price: {pick['Odds']}</b> <small>(Tissue: {pick['Tissue']})</small><br>
-                    <b>Gap: <span style="color:#00ff00;">{pick['Gap']}</span></b><br>
-                    <b>Market: <span style="color:{pick['Color']};">{pick['Move']}</span></b><br>
-                    <p style="font-size: 0.8em; margin-top:10px; color:#aaa;">{pick['Analysis']}</p>
-                </div>
-                """, unsafe_allow_html=True)
+    # TOP SELECTIONS (Unlimited Cards)
+    if st.session_state.value_horses:
+        st.subheader(f"🎯 Qualifying Selections ({len(st.session_state.value_horses)})")
+        for i in range(0, len(st.session_state.value_horses), 4):
+            cols = st.columns(4)
+            for j, h in enumerate(st.session_state.value_horses[i:i+4]):
+                with cols[j]:
+                    color = "#FFD700" if h['Tag'] == "VALUE" else "#00FFCC"
+                    st.markdown(f"""<div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:2px solid #333; min-height:280px; margin-bottom:10px;">
+                        <h3 style='margin:0;'>{h['Horse']}</h3><b>{h['Time']} {h['Course']}</b><hr style='border-color:black;'>
+                        <b>Price: {h['Odds']}</b> | Fair: {h['Tissue']}<br>
+                        <b>Gap: {h['Gap']}</b> | {h['Move']}<br>
+                        <small>{h['Analysis']}</small></div>""", unsafe_allow_html=True)
         
-        if st.button("📤 Log These Selections to Ledger"):
-            if log_to_sheets(st.session_state.picks):
-                st.success("✅ Logged to Google Sheets!")
+        if st.button("📤 Log Picks to Sheets"):
+            ledger = load_ledger()
+            new_df = pd.DataFrame(st.session_state.value_horses)
+            for col in ["Result", "Pos", "P/L"]: new_df[col] = "Pending"
+            updated = pd.concat([ledger, new_df], ignore_index=True).drop_duplicates(subset=['Horse', 'Date', 'Time'])
+            conn.update(spreadsheet=GSHEET_URL, data=updated)
+            st.success("Log Updated!")
 
-    # BROWSER SECTION
-    if 'races' in st.session_state:
+    # FULL BROWSER
+    if st.session_state.all_races:
         st.divider()
-        st.header("🏁 Full Race Browser")
-        for race in st.session_state.races:
-            has_pick = any(p['Horse'] == r['horse'] and p['Time'] == race['off_time'] for p in st.session_state.picks for r in race['runners'])
-            if show_all or has_pick:
-                with st.expander(f"🕒 {race['off_time']} - {race['course']} {'⭐' if has_pick else ''}"):
-                    for r in race['runners']:
-                        s, _ = get_advanced_score(r, race)
-                        o = float(r.get('sp_dec') or 1.0)
-                        is_sel = any(p['Horse'] == r['horse'] for p in st.session_state.picks)
-                        name_display = f"**{r['horse']}**" if is_sel else r['horse']
-                        st.write(f"{name_display} | Score: {s} | Odds: {o}")
+        st.header("🏁 Racecard Browser")
+        for race in st.session_state.all_races:
+            cat = get_race_category(race)
+            if code_filter != "All Codes" and cat != code_filter: continue
+            
+            has_sel = any(any(p['Horse'] == r.get('horse') and p['Time'] == race.get('off_time') for p in st.session_state.value_horses) for r in race.get('runners', []))
+            
+            if show_all_races or has_sel:
+                with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')} ({cat}) {'⭐' if has_sel else ''}"):
+                    for r in race.get('runners', []):
+                        s, _, _, _ = get_advanced_score(r)
+                        is_p = any(p['Horse'] == r.get('horse') and p['Time'] == race.get('off_time') for p in st.session_state.value_horses)
+                        style = "color: green; font-weight: bold;" if is_p else "color: gray;"
+                        st.markdown(f"<span style='{style}'>{r.get('horse')}</span> | Score: {s} | Odds: {r.get('sp_dec')}", unsafe_allow_html=True)
 
 with tab2:
-    st.subheader("📊 Your Betting History")
-    df_ledger = load_ledger()
-    if not df_ledger.empty:
-        st.dataframe(df_ledger, use_container_width=True)
-    else:
-        st.info("No bets logged yet.")
+    if st.button("🔄 SETTLE PENDING BETS"):
+        st.toast(settle_ledger())
+    st.dataframe(load_ledger(), use_container_width=True)
