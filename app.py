@@ -11,9 +11,9 @@ API_PASS = st.secrets.get("API_PASS", "")
 GSHEET_URL = st.secrets.get("gsheet_url", "")
 BASE_URL = "https://api.theracingapi.com/v1"
 
-st.set_page_config(page_title="Value Finder Pro V8.5", layout="wide")
+st.set_page_config(page_title="Value Finder Pro V8.6", layout="wide")
 
-# --- 2. ENGINES (Added Going/Ground Logic) ---
+# --- 2. ENGINES (Fixed & Robust) ---
 def get_race_category(race):
     is_jumps = race.get('jumps', '')
     race_type = str(race.get('type', '')).lower()
@@ -26,22 +26,28 @@ def get_race_category(race):
 def get_advanced_score(r_data, race_going):
     s = 0
     reasons = []
-    # Core Logic
-    if str(r_data.get('form', '')).endswith('1'): 
-        s += 15; reasons.append("✅ LTO Winner")
-    if 'C' in str(r_data.get('cd', '')).upper(): 
-        s += 10; reasons.append("🎯 Course Form")
-    
-    # Ground/Going Logic (New)
-    past_going = str(r_data.get('going', '')).upper()
-    current_going = str(race_going).upper()
-    if current_going in past_going and len(current_going) > 2:
-        s += 5; reasons.append("🌍 Ground Match")
+    try:
+        # Core Form Logic
+        form = str(r_data.get('form', ''))
+        if form.endswith('1'): 
+            s += 15; reasons.append("✅ LTO Winner")
         
+        cd = str(r_data.get('cd', '')).upper()
+        if 'C' in cd: s += 10; reasons.append("🎯 Course Form")
+        if 'D' in cd: s += 5; reasons.append("🏁 Distance Form")
+        
+        # Ground Match (Now Optional/Safe)
+        current_g = str(race_going).upper()
+        past_g = str(r_data.get('going', '')).upper()
+        if len(current_g) > 2 and current_g in past_g:
+            s += 5; reasons.append("🌍 Ground Match")
+    except:
+        pass # Ensure one bad data point doesn't kill the whole score
     return s, reasons
 
 def get_tissue_price(score):
-    return round(100 / (score + 12), 2)
+    # Prevents division by zero and keeps prices realistic
+    return round(100 / (max(score, 1) + 12), 2)
 
 # --- 3. DATA OPS ---
 try:
@@ -64,7 +70,7 @@ app_mode = st.sidebar.radio("Active Engine:", ["Value Strategy", "Elite Performa
 
 st.sidebar.divider()
 st.sidebar.header("🛡️ Settings")
-min_score = st.sidebar.slider("Min Value Score", 0, 60, 20)
+min_score = st.sidebar.slider("Min Value Score", 0, 60, 15) # Lowered default for more results
 min_gap = st.sidebar.slider("Min Gap % Filter", -100, 100, -100)
 show_all_races = st.sidebar.toggle("Show ALL Racecards", value=True)
 
@@ -75,22 +81,26 @@ tab1, tab2, tab3 = st.tabs(["🚀 Analysis", "📊 Ledger", "📈 Stats"])
 
 with tab1:
     if st.button('🚀 Run Analysis'):
-        with st.spinner("Finding Value..."):
+        with st.spinner("Fetching Data..."):
             auth = HTTPBasicAuth(API_USER, API_PASS)
             r = requests.get(f"{BASE_URL}/racecards/standard", auth=auth)
             if r.status_code == 200:
                 st.session_state.all_races = r.json().get('racecards', [])
                 picks = []
                 for race in st.session_state.all_races:
-                    going = race.get('going', 'Unknown')
+                    going = race.get('going', 'N/A')
                     for r_data in race.get('runners', []):
                         score, reasons = get_advanced_score(r_data, going)
                         odds = float(r_data.get('sp_dec') or 1.0)
                         tissue = get_tissue_price(score)
                         gap = round(((odds - tissue) / tissue) * 100, 1)
                         
-                        is_match = (app_mode == "Value Strategy" and odds >= 4.0 and score >= min_score) or \
-                                   (app_mode == "Elite Performance" and odds < 4.0 and score >= 15)
+                        # Selection Logic
+                        is_match = False
+                        if app_mode == "Value Strategy":
+                            if odds >= 4.0 and score >= min_score: is_match = True
+                        else:
+                            if odds < 4.0 and score >= 10: is_match = True
                         
                         if is_match and gap >= min_gap:
                             picks.append({
@@ -100,16 +110,25 @@ with tab1:
                                 "Gap": f"{gap}%", "Tag": app_mode, "Analysis": " | ".join(reasons)
                             })
                 st.session_state.value_horses = picks
+            else:
+                st.error(f"API Error: {r.status_code}")
 
-    # 🟢 Safe List Display (Vertical Bars instead of Grid to prevent IndexError)
+    # --- RESULTS DASHBOARD ---
+    if st.session_state.all_races:
+        total_races = len(st.session_state.all_races)
+        total_picks = len(st.session_state.value_horses)
+        c1, c2 = st.columns(2)
+        c1.metric("Races Scanned", total_races)
+        c2.metric("Qualifiers Found", total_picks)
+
     if st.session_state.value_horses:
-        st.subheader(f"🎯 Current {app_mode} Selections")
+        st.divider()
         for h in st.session_state.value_horses:
             color = "#FFD700" if h['Tag'] == "Value Strategy" else "#00FFCC"
             st.markdown(f"""
             <div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:2px solid #333; margin-bottom:10px;">
-                <span style="font-size:1.2em; font-weight:bold;">{h['Horse']}</span> - {h['Time']} {h['Course']}<br>
-                <b>Odds: {h['Odds']}</b> | Score: {h['Score']} | <b>Gap: {h['Gap']}</b><br>
+                <span style="font-size:1.1em; font-weight:bold;">{h['Horse']}</span> - {h['Time']} {h['Course']}<br>
+                <b>Odds: {h['Odds']}</b> | Score: {h['Score']} | Gap: {h['Gap']}<br>
                 <small>{h['Analysis']}</small>
             </div>
             """, unsafe_allow_html=True)
@@ -121,7 +140,20 @@ with tab1:
             new_df['P/L'] = 0.0
             updated = pd.concat([ledger, new_df], ignore_index=True).drop_duplicates(subset=['Horse', 'Date', 'Time'])
             conn.update(spreadsheet=GSHEET_URL, data=updated)
-            st.success("Successfully logged to Sheets!")
+            st.success("Logged!")
+
+    # --- BROWSER ---
+    if st.session_state.all_races:
+        st.divider()
+        for race in st.session_state.all_races:
+            race_picks = [p['Horse'] for p in st.session_state.value_horses if p['Time'] == race['off_time'] and p['Course'] == race['course']]
+            if show_all_races or race_picks:
+                with st.expander(f"🕒 {race['off_time']} - {race['course']} {'⭐' if race_picks else ''}"):
+                    for r in race['runners']:
+                        h_name = r.get('horse')
+                        is_sel = h_name in race_picks
+                        style = "color: green; font-weight: bold;" if is_sel else "color: gray;"
+                        st.markdown(f"<span style='{style}'>{h_name}</span> | Odds: {r.get('sp_dec')}", unsafe_allow_html=True)
 
 with tab2:
     st.dataframe(load_ledger(), use_container_width=True)
@@ -130,23 +162,14 @@ with tab3:
     st.header("📈 Strategy Stats")
     df = load_ledger()
     if not df.empty and 'Result' in df.columns:
-        # Filter for settled bets only
         settled = df[df['Result'].str.lower().isin(['winner', 'loser'])].copy()
         if not settled.empty:
-            # Simple Columnar metrics
             m1, m2, m3 = st.columns(3)
-            total_bets = len(settled)
             wins = len(settled[settled['Result'].str.lower() == 'winner'])
-            # Attempt P/L calculation if column exists
+            m1.metric("Total Bets", len(settled))
+            m2.metric("Strike Rate", f"{(wins/len(settled)*100):.1f}%")
             try:
                 pl = pd.to_numeric(settled['P/L'], errors='coerce').sum()
                 m3.metric("Total P/L", f"{pl:.2f} pts")
-            except:
-                m3.metric("Total P/L", "N/A")
-            
-            m1.metric("Total Bets", total_bets)
-            m2.metric("Strike Rate", f"{(wins/total_bets*100):.1f}%")
-        else:
-            st.info("No winners/losers marked in Ledger yet.")
-    else:
-        st.info("Stats will appear once the Ledger has 'Result' data.")
+            except: pass
+        else: st.info("Settle some bets to see stats.")
