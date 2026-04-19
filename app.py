@@ -13,7 +13,7 @@ GSHEET_URL = st.secrets.get("gsheet_url", "")
 BASE_URL = "https://api.theracingapi.com/v1"
 ELITE_JOCKEYS = ["W Buick", "O Murphy", "J Doyle", "R Moore", "T Marquand", "H Doyle", "B Curtis", "L Morris"]
 
-st.set_page_config(page_title="Value Finder Pro V8.1", layout="wide")
+st.set_page_config(page_title="Value Finder Pro V8.2", layout="wide")
 
 # --- 2. ENGINES ---
 def get_race_category(race):
@@ -57,14 +57,11 @@ def load_ledger():
         try:
             df = conn.read(spreadsheet=GSHEET_URL, ttl=0)
             df.columns = [str(c).strip().title() for c in df.columns]
-            # SAFETY CHECK: If P/L is missing, create it
-            if not df.empty and 'P/L' not in df.columns:
-                df['P/L'] = 0.0
+            if not df.empty and 'P/L' not in df.columns: df['P/L'] = 0.0
             if 'P/L' in df.columns:
                 df['P/L'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
             return df
-        except Exception as e:
-            st.error(f"Sheet Error: {e}")
+        except: pass
     return pd.DataFrame()
 
 # --- 4. INTERFACE ---
@@ -108,15 +105,22 @@ with tab1:
                             })
                 st.session_state.value_horses = picks
 
+    # 🟢 FIXED CARD GRID LOGIC
     if st.session_state.value_horses:
         st.subheader(f"🎯 Qualifying {app_mode} Selections")
-        cols = st.columns(4)
-        for i, h in enumerate(st.session_state.value_horses):
-            with cols[i % 4]:
-                color = "#FFD700" if h['Tag'] == "Value Strategy" else "#00FFCC"
-                st.markdown(f"""<div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:2px solid #333; margin-bottom:10px;">
-                    <h3 style='margin:0;'>{h['Horse']}</h3><b>{h['Time']} {h['Course']}</b><br>
-                    <b>Odds: {h['Odds']}</b> | Gap: {h['Gap']}</div>""", unsafe_allow_html=True)
+        picks = st.session_state.value_horses
+        
+        # We loop in chunks of 4 and handle the column index safely
+        for i in range(0, len(picks), 4):
+            cols = st.columns(4)
+            for j in range(4):
+                if i + j < len(picks):
+                    h = picks[i + j]
+                    with cols[j]:
+                        color = "#FFD700" if h['Tag'] == "Value Strategy" else "#00FFCC"
+                        st.markdown(f"""<div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:2px solid #333; margin-bottom:10px;">
+                            <h3 style='margin:0;'>{h['Horse']}</h3><b>{h['Time']} {h['Course']}</b><br>
+                            <b>Odds: {h['Odds']}</b> | Gap: {h['Gap']}</div>""", unsafe_allow_html=True)
         
         if st.button("📤 Log to Ledger"):
             ledger = load_ledger()
@@ -129,41 +133,37 @@ with tab1:
     if st.session_state.all_races:
         st.divider()
         for race in st.session_state.all_races:
-            has_p = any(p['Horse'] == r['horse'] for p in st.session_state.value_horses for r in race['runners'])
+            has_p = any(p['Horse'] == r['horse'] and p['Time'] == race['off_time'] for p in st.session_state.value_horses for r in race['runners'])
             if show_all_races or has_p:
                 with st.expander(f"🕒 {race['off_time']} - {race['course']} {'⭐' if has_p else ''}"):
                     for r in race['runners']:
                         s, _ = get_advanced_score(r)
-                        is_sel = any(p['Horse'] == r['horse'] for p in st.session_state.value_horses)
-                        st.markdown(f"<span style='color:{'green' if is_sel else 'gray'}; font-weight:{'bold' if is_sel else 'normal'}'>{r['horse']}</span> | Score: {s} | Odds: {r.get('sp_dec')}", unsafe_allow_html=True)
+                        is_sel = any(p['Horse'] == r['horse'] and p['Time'] == race['off_time'] for p in st.session_state.value_horses)
+                        style = "color: green; font-weight: bold;" if is_sel else "color: gray;"
+                        st.markdown(f"<span style='{style}'>{r['horse']}</span> | Score: {s} | Odds: {r.get('sp_dec')}", unsafe_allow_html=True)
 
 with tab2:
     ledger_df = load_ledger()
     if not ledger_df.empty:
         st.dataframe(ledger_df, use_container_width=True)
     else:
-        st.warning("Ledger is empty. Check your Google Sheet headers!")
+        st.info("No data in Ledger.")
 
 with tab3:
     st.header("📈 ROI Dashboard")
     df = load_ledger()
-    # Check if we have data and the required column to avoid the KeyError
-    if not df.empty and 'P/L' in df.columns and 'Result' in df.columns:
-        valid_bets = df[df['Result'].str.lower().isin(['winner', 'loser'])]
+    if not df.empty and 'Result' in df.columns:
+        valid_bets = df[df['Result'].str.lower().isin(['winner', 'loser'])].copy()
         if not valid_bets.empty:
-            total_bets = len(valid_bets)
-            winners = len(valid_bets[valid_bets['Result'].str.lower() == 'winner'])
-            total_pl = valid_bets['P/L'].sum()
-            
             m1, m2, m3 = st.columns(3)
-            m1.metric("Total Bets", total_bets)
-            m2.metric("Strike Rate", f"{(winners/total_bets*100):.1f}%")
-            m3.metric("Total P/L", f"{total_pl:.2f} pts")
+            m1.metric("Total Bets", len(valid_bets))
+            m2.metric("Strike Rate", f"{(len(valid_bets[valid_bets['Result'].str.lower() == 'winner'])/len(valid_bets)*100):.1f}%")
+            m3.metric("Total P/L", f"{valid_bets['P/L'].sum():.2f} pts")
             
-            valid_bets['Cumulative'] = valid_bets['P/L'].cumsum()
-            fig = px.line(valid_bets, y='Cumulative', title="Profit Growth")
-            st.plotly_chart(fig, use_container_width=True)
+            # Graph safety: Only show if we have 2+ points
+            if len(valid_bets) > 1:
+                valid_bets['Cumulative'] = valid_bets['P/L'].cumsum()
+                fig = px.line(valid_bets, y='Cumulative', title="Profit Growth")
+                st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("Dashboard will activate once you mark bets as 'Winner' or 'Loser' in the Ledger.")
-    else:
-        st.info("Awaiting ledger data with 'Result' and 'P/L' columns.")
+            st.info("Settle some bets as 'Winner' or 'Loser' to see stats.")
