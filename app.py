@@ -3,7 +3,7 @@ import pandas as pd
 import requests
 from requests.auth import HTTPBasicAuth
 from datetime import datetime
-import plotly.express as px # Added for the new Dashboard
+import plotly.express as px
 from streamlit_gsheets import GSheetsConnection
 
 # --- 1. SETTINGS & CONFIG ---
@@ -13,9 +13,9 @@ GSHEET_URL = st.secrets.get("gsheet_url", "")
 BASE_URL = "https://api.theracingapi.com/v1"
 ELITE_JOCKEYS = ["W Buick", "O Murphy", "J Doyle", "R Moore", "T Marquand", "H Doyle", "B Curtis", "L Morris"]
 
-st.set_page_config(page_title="Value Finder Pro V8.0", layout="wide")
+st.set_page_config(page_title="Value Finder Pro V8.1", layout="wide")
 
-# --- 2. ENGINES (Existing Logic) ---
+# --- 2. ENGINES ---
 def get_race_category(race):
     is_jumps = race.get('jumps', '')
     race_type = str(race.get('type', '')).lower()
@@ -46,7 +46,7 @@ def get_advanced_score(r_data):
 def get_tissue_price(score):
     return round(100 / (score + 12), 2)
 
-# --- 3. DATA OPS & LEDGER ---
+# --- 3. DATA OPS ---
 try:
     conn = st.connection("gsheets", type=GSheetsConnection, ttl=0)
 except:
@@ -57,11 +57,14 @@ def load_ledger():
         try:
             df = conn.read(spreadsheet=GSHEET_URL, ttl=0)
             df.columns = [str(c).strip().title() for c in df.columns]
-            # Ensure P/L is numeric
+            # SAFETY CHECK: If P/L is missing, create it
+            if not df.empty and 'P/L' not in df.columns:
+                df['P/L'] = 0.0
             if 'P/L' in df.columns:
                 df['P/L'] = pd.to_numeric(df['P/L'], errors='coerce').fillna(0)
             return df
-        except: pass
+        except Exception as e:
+            st.error(f"Sheet Error: {e}")
     return pd.DataFrame()
 
 # --- 4. INTERFACE ---
@@ -100,13 +103,13 @@ with tab1:
                                 "Date": datetime.now().strftime("%Y-%m-%d"),
                                 "Horse": r_data.get('horse'), "Course": race.get('course'),
                                 "Time": race.get('off_time'), "Odds": odds, "Score": score,
-                                "Gap": f"{gap}%", "Tag": app_mode, "Analysis": " | ".join(reasons)
+                                "Gap": f"{gap}%", "Tag": app_mode, "Analysis": " | ".join(reasons),
+                                "Result": "Pending", "Pos": "-", "P/L": 0.0
                             })
                 st.session_state.value_horses = picks
 
-    # Display Top Cards
     if st.session_state.value_horses:
-        st.subheader(f"🎯 Current {app_mode} Selections")
+        st.subheader(f"🎯 Qualifying {app_mode} Selections")
         cols = st.columns(4)
         for i, h in enumerate(st.session_state.value_horses):
             with cols[i % 4]:
@@ -118,41 +121,49 @@ with tab1:
         if st.button("📤 Log to Ledger"):
             ledger = load_ledger()
             new_df = pd.DataFrame(st.session_state.value_horses)
-            new_df['Result'] = 'Pending'
             updated = pd.concat([ledger, new_df], ignore_index=True).drop_duplicates(subset=['Horse', 'Date', 'Time'])
             conn.update(spreadsheet=GSHEET_URL, data=updated)
             st.success("Ledger Updated!")
 
+    # Full Browser
+    if st.session_state.all_races:
+        st.divider()
+        for race in st.session_state.all_races:
+            has_p = any(p['Horse'] == r['horse'] for p in st.session_state.value_horses for r in race['runners'])
+            if show_all_races or has_p:
+                with st.expander(f"🕒 {race['off_time']} - {race['course']} {'⭐' if has_p else ''}"):
+                    for r in race['runners']:
+                        s, _ = get_advanced_score(r)
+                        is_sel = any(p['Horse'] == r['horse'] for p in st.session_state.value_horses)
+                        st.markdown(f"<span style='color:{'green' if is_sel else 'gray'}; font-weight:{'bold' if is_sel else 'normal'}'>{r['horse']}</span> | Score: {s} | Odds: {r.get('sp_dec')}", unsafe_allow_html=True)
+
 with tab2:
-    st.dataframe(load_ledger(), use_container_width=True)
+    ledger_df = load_ledger()
+    if not ledger_df.empty:
+        st.dataframe(ledger_df, use_container_width=True)
+    else:
+        st.warning("Ledger is empty. Check your Google Sheet headers!")
 
 with tab3:
-    st.header("📈 Performance Analytics")
+    st.header("📈 ROI Dashboard")
     df = load_ledger()
-    if not df.empty and 'Result' in df.columns:
-        # 1. Top Level Metrics
-        total_bets = len(df[df['Result'] != 'Pending'])
-        winners = len(df[df['Result'] == 'Winner'])
-        strike_rate = (winners / total_bets * 100) if total_bets > 0 else 0
-        total_pl = df['P/L'].sum()
-        roi = (total_pl / total_bets * 100) if total_bets > 0 else 0
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Bets", total_bets)
-        m2.metric("Strike Rate", f"{strike_rate:.1f}%")
-        m3.metric("Profit/Loss", f"{total_pl:.2f} pts", delta=f"{total_pl:.2f}")
-        m4.metric("ROI", f"{roi:.1f}%")
-
-        # 2. Strategy Breakdown
-        st.divider()
-        st.subheader("Strategy Performance")
-        strat_stats = df.groupby('Tag').agg({'P/L': 'sum', 'Horse': 'count'}).rename(columns={'Horse': 'Bets'})
-        st.bar_chart(strat_stats['P/L'])
-
-        # 3. Cumulative Profit Graph
-        st.subheader("Profit Curve")
-        df['Cumulative'] = df['P/L'].cumsum()
-        fig = px.line(df, x=df.index, y='Cumulative', title="Profit Over Time")
-        st.plotly_chart(fig, use_container_width=True)
+    # Check if we have data and the required column to avoid the KeyError
+    if not df.empty and 'P/L' in df.columns and 'Result' in df.columns:
+        valid_bets = df[df['Result'].str.lower().isin(['winner', 'loser'])]
+        if not valid_bets.empty:
+            total_bets = len(valid_bets)
+            winners = len(valid_bets[valid_bets['Result'].str.lower() == 'winner'])
+            total_pl = valid_bets['P/L'].sum()
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Bets", total_bets)
+            m2.metric("Strike Rate", f"{(winners/total_bets*100):.1f}%")
+            m3.metric("Total P/L", f"{total_pl:.2f} pts")
+            
+            valid_bets['Cumulative'] = valid_bets['P/L'].cumsum()
+            fig = px.line(valid_bets, y='Cumulative', title="Profit Growth")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Dashboard will activate once you mark bets as 'Winner' or 'Loser' in the Ledger.")
     else:
-        st.info("Log some winners and losers in your Ledger to see ROI data!")
+        st.info("Awaiting ledger data with 'Result' and 'P/L' columns.")
