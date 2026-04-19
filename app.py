@@ -11,9 +11,9 @@ API_PASS = st.secrets.get("API_PASS", "")
 GSHEET_URL = st.secrets.get("gsheet_url", "")
 BASE_URL = "https://api.theracingapi.com/v1"
 
-st.set_page_config(page_title="Value Finder Pro V8.6", layout="wide")
+st.set_page_config(page_title="Value Finder Pro V8.7", layout="wide")
 
-# --- 2. ENGINES (Fixed & Robust) ---
+# --- 2. ENGINES ---
 def get_race_category(race):
     is_jumps = race.get('jumps', '')
     race_type = str(race.get('type', '')).lower()
@@ -36,18 +36,19 @@ def get_advanced_score(r_data, race_going):
         if 'C' in cd: s += 10; reasons.append("🎯 Course Form")
         if 'D' in cd: s += 5; reasons.append("🏁 Distance Form")
         
-        # Ground Match (Now Optional/Safe)
+        # Ground Match Logic
         current_g = str(race_going).upper()
         past_g = str(r_data.get('going', '')).upper()
         if len(current_g) > 2 and current_g in past_g:
             s += 5; reasons.append("🌍 Ground Match")
     except:
-        pass # Ensure one bad data point doesn't kill the whole score
+        pass 
     return s, reasons
 
 def get_tissue_price(score):
-    # Prevents division by zero and keeps prices realistic
-    return round(100 / (max(score, 1) + 12), 2)
+    # Base calculation: A score of 0 results in a tissue of 8.33 (approx 7/1)
+    # Higher scores drop the tissue price (making the horse 'fancied')
+    return round(100 / (max(score, 0) + 12), 2)
 
 # --- 3. DATA OPS ---
 try:
@@ -70,7 +71,9 @@ app_mode = st.sidebar.radio("Active Engine:", ["Value Strategy", "Elite Performa
 
 st.sidebar.divider()
 st.sidebar.header("🛡️ Settings")
-min_score = st.sidebar.slider("Min Value Score", 0, 60, 15) # Lowered default for more results
+# CHANGED: Default min_score set to 5 for better visibility
+min_score = st.sidebar.slider("Min Value Score", 0, 60, 5)
+# CHANGED: Default min_gap set to -100 to show more potential value
 min_gap = st.sidebar.slider("Min Gap % Filter", -100, 100, -100)
 show_all_races = st.sidebar.toggle("Show ALL Racecards", value=True)
 
@@ -95,12 +98,13 @@ with tab1:
                         tissue = get_tissue_price(score)
                         gap = round(((odds - tissue) / tissue) * 100, 1)
                         
-                        # Selection Logic
+                        # Logic Gate
                         is_match = False
                         if app_mode == "Value Strategy":
                             if odds >= 4.0 and score >= min_score: is_match = True
                         else:
-                            if odds < 4.0 and score >= 10: is_match = True
+                            # Elite Mode check
+                            if odds < 4.0 and score >= min_score: is_match = True
                         
                         if is_match and gap >= min_gap:
                             picks.append({
@@ -129,7 +133,7 @@ with tab1:
             <div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:2px solid #333; margin-bottom:10px;">
                 <span style="font-size:1.1em; font-weight:bold;">{h['Horse']}</span> - {h['Time']} {h['Course']}<br>
                 <b>Odds: {h['Odds']}</b> | Score: {h['Score']} | Gap: {h['Gap']}<br>
-                <small>{h['Analysis']}</small>
+                <small>{h['Analysis'] if h['Analysis'] else 'No specific trends found'}</small>
             </div>
             """, unsafe_allow_html=True)
         
@@ -140,12 +144,13 @@ with tab1:
             new_df['P/L'] = 0.0
             updated = pd.concat([ledger, new_df], ignore_index=True).drop_duplicates(subset=['Horse', 'Date', 'Time'])
             conn.update(spreadsheet=GSHEET_URL, data=updated)
-            st.success("Logged!")
+            st.success("Logged to Ledger!")
 
     # --- BROWSER ---
     if st.session_state.all_races:
         st.divider()
         for race in st.session_state.all_races:
+            # Match picks to this race for highlighting
             race_picks = [p['Horse'] for p in st.session_state.value_horses if p['Time'] == race['off_time'] and p['Course'] == race['course']]
             if show_all_races or race_picks:
                 with st.expander(f"🕒 {race['off_time']} - {race['course']} {'⭐' if race_picks else ''}"):
@@ -172,4 +177,6 @@ with tab3:
                 pl = pd.to_numeric(settled['P/L'], errors='coerce').sum()
                 m3.metric("Total P/L", f"{pl:.2f} pts")
             except: pass
-        else: st.info("Settle some bets to see stats.")
+        else: st.info("Mark some winners/losers in your Google Sheet to see ROI stats.")
+    else:
+        st.info("Stats will activate once 'Result' data is logged.")
