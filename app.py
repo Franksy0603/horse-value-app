@@ -3,7 +3,6 @@ import pandas as pd
 import requests
 from requests.auth import HTTPBasicAuth
 from datetime import datetime
-import plotly.express as px
 from streamlit_gsheets import GSheetsConnection
 
 # --- 1. SETTINGS & CONFIG ---
@@ -13,7 +12,7 @@ GSHEET_URL = st.secrets.get("gsheet_url", "")
 BASE_URL = "https://api.theracingapi.com/v1"
 ELITE_JOCKEYS = ["W Buick", "O Murphy", "J Doyle", "R Moore", "T Marquand", "H Doyle", "B Curtis", "L Morris"]
 
-st.set_page_config(page_title="Value Finder Pro V8.4", layout="wide")
+st.set_page_config(page_title="Value Finder Pro V7.8 (Stable)", layout="wide")
 
 # --- 2. ENGINES ---
 def get_race_category(race):
@@ -57,7 +56,6 @@ def load_ledger():
         try:
             df = conn.read(spreadsheet=GSHEET_URL, ttl=0)
             df.columns = [str(c).strip().title() for c in df.columns]
-            if not df.empty and 'P/L' not in df.columns: df['P/L'] = 0.0
             return df
         except: pass
     return pd.DataFrame()
@@ -68,98 +66,88 @@ app_mode = st.sidebar.radio("Active Engine:", ["Value Strategy", "Elite Performa
 
 st.sidebar.divider()
 st.sidebar.header("🛡️ Settings")
+code_filter = st.sidebar.selectbox("Filter by Code", ["All Codes", "Flat (AW)", "Jumps", "Flat (Turf)"])
 min_score = st.sidebar.slider("Min Value Score", 0, 60, 20)
 min_gap = st.sidebar.slider("Min Gap % Filter", -100, 100, -100)
+
+st.sidebar.divider()
+st.sidebar.subheader("🔍 Browser Tools")
 show_all_races = st.sidebar.toggle("Show ALL Racecards", value=True)
 
 if 'all_races' not in st.session_state: st.session_state.all_races = []
 if 'value_horses' not in st.session_state: st.session_state.value_horses = []
 
-tab1, tab2, tab3 = st.tabs(["🚀 Analysis", "📊 Ledger", "📈 ROI Dashboard"])
+tab1, tab2 = st.tabs(["🚀 Market Analysis", "📊 Ledger"])
 
 with tab1:
     if st.button('🚀 Run Analysis'):
-        with st.spinner("Analyzing Market..."):
+        with st.spinner("Analyzing Every Runner..."):
             auth = HTTPBasicAuth(API_USER, API_PASS)
             r = requests.get(f"{BASE_URL}/racecards/standard", auth=auth)
             if r.status_code == 200:
                 st.session_state.all_races = r.json().get('racecards', [])
-                picks = []
+                
+                new_picks = []
                 for race in st.session_state.all_races:
+                    cat = get_race_category(race)
+                    if code_filter != "All Codes" and cat != code_filter: continue
+                    
                     for r_data in race.get('runners', []):
                         score, reasons = get_advanced_score(r_data)
                         odds = float(r_data.get('sp_dec') or 1.0)
                         tissue = get_tissue_price(score)
                         gap = round(((odds - tissue) / tissue) * 100, 1)
-                        is_match = (app_mode == "Value Strategy" and odds >= 4.0 and score >= min_score) or \
-                                   (app_mode == "Elite Performance" and odds < 4.0 and score >= 15)
+                        
+                        is_match = False
+                        if app_mode == "Value Strategy":
+                            if odds >= 4.0 and score >= min_score: is_match = True
+                        else:
+                            if odds < 4.0 and score >= 15: is_match = True
+                        
                         if is_match and gap >= min_gap:
-                            picks.append({
+                            new_picks.append({
                                 "Date": datetime.now().strftime("%Y-%m-%d"),
                                 "Horse": r_data.get('horse'), "Course": race.get('course'),
                                 "Time": race.get('off_time'), "Odds": odds, "Score": score,
-                                "Gap": f"{gap}%", "Tag": app_mode, "Analysis": " | ".join(reasons),
-                                "Result": "Pending", "Pos": "-", "P/L": 0.0
+                                "Gap": f"{gap}%", "Tag": app_mode, "Analysis": " | ".join(reasons)
                             })
-                st.session_state.value_horses = picks
+                st.session_state.value_horses = new_picks
 
-    # --- NO-CRASH DISPLAY LOGIC ---
+    # DISPLAY TOP PICKS
     if st.session_state.value_horses:
-        st.subheader(f"🎯 Qualifying {app_mode} Selections")
+        st.subheader(f"🎯 Qualifying Selections ({len(st.session_state.value_horses)})")
+        for h in st.session_state.value_horses:
+            color = "#FFD700" if h['Tag'] == "Value Strategy" else "#00FFCC"
+            st.markdown(f"""<div style="background-color:{color}; padding:10px; border-radius:8px; color:#000; border:1px solid #333; margin-bottom:5px;">
+                <b>{h['Horse']}</b> ({h['Time']} {h['Course']}) | <b>Odds: {h['Odds']}</b> | Score: {h['Score']}
+            </div>""", unsafe_allow_html=True)
         
-        # We use standard Streamlit columns but wrapped in a simpler loop 
-        # that doesn't rely on tuple assignment
-        picks = st.session_state.value_horses
-        
-        # Display cards one by one in a predictable 4-wide pattern
-        col_list = st.columns(4)
-        for i, h in enumerate(picks):
-            target_col = col_list[i % 4]
-            with target_col:
-                try:
-                    color = "#FFD700" if h['Tag'] == "Value Strategy" else "#00FFCC"
-                    st.markdown(f"""
-                    <div style="background-color:{color}; padding:12px; border-radius:8px; color:#000; border:1px solid #333; margin-bottom:10px;">
-                        <h4 style='margin:0;'>{h['Horse']}</h4>
-                        <b>{h['Time']} {h['Course']}</b><br>
-                        <b>Odds: {h['Odds']}</b> | Score: {h['Score']}<br>
-                        <small style='font-size:0.75em;'>{h['Analysis']}</small>
-                    </div>
-                    """, unsafe_allow_html=True)
-                except:
-                    st.error("Error rendering card.")
-
-        if st.button("📤 Log to Ledger"):
+        if st.button("📤 Log Picks to Sheets"):
             ledger = load_ledger()
             new_df = pd.DataFrame(st.session_state.value_horses)
+            new_df['Result'] = 'Pending'
             updated = pd.concat([ledger, new_df], ignore_index=True).drop_duplicates(subset=['Horse', 'Date', 'Time'])
             conn.update(spreadsheet=GSHEET_URL, data=updated)
-            st.success("Ledger Updated!")
+            st.success("Log Updated!")
 
-    # --- BROWSER SECTION ---
+    # BROWSER
     if st.session_state.all_races:
         st.divider()
+        st.header("🏁 Racecard Browser")
         for race in st.session_state.all_races:
-            # Safer way to check for highlighted horses
-            sel_names = [p['Horse'] for p in st.session_state.value_horses if p['Time'] == race['off_time']]
-            if show_all_races or sel_names:
-                with st.expander(f"🕒 {race['off_time']} - {race['course']} {'⭐' if sel_names else ''}"):
-                    for r in race['runners']:
+            cat = get_race_category(race)
+            if code_filter != "All Codes" and cat != code_filter: continue
+            
+            # Simple highlight logic
+            race_picks = [p['Horse'] for p in st.session_state.value_horses if p['Time'] == race['off_time']]
+            
+            if show_all_races or race_picks:
+                with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')} {'⭐' if race_picks else ''}"):
+                    for r in race.get('runners', []):
                         h_name = r.get('horse')
-                        is_sel = h_name in sel_names
+                        is_sel = h_name in race_picks
                         style = "color: green; font-weight: bold;" if is_sel else "color: gray;"
-                        st.markdown(f"<span style='{style}'>{h_name}</span> | Odds: {r.get('sp_dec')}", unsafe_allow_html=True)
+                        st.markdown(f"<span style='{style}'>{h_name}</span> | Score: ?? | Odds: {r.get('sp_dec')}", unsafe_allow_html=True)
 
 with tab2:
     st.dataframe(load_ledger(), use_container_width=True)
-
-with tab3:
-    st.header("📈 ROI Dashboard")
-    df = load_ledger()
-    if not df.empty and 'Result' in df.columns and 'P/L' in df.columns:
-        valid = df[df['Result'].str.lower().isin(['winner', 'loser'])].copy()
-        if not valid.empty:
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Total Bets", len(valid))
-            m2.metric("Strike Rate", f"{(len(valid[valid['Result'].str.lower() == 'winner'])/len(valid)*100):.1f}%")
-            m3.metric("Total P/L", f"{valid['P/L'].sum():.2f} pts")
