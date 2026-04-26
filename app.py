@@ -11,7 +11,7 @@ API_PASS = st.secrets.get("API_PASS", "")
 GSHEET_URL = st.secrets.get("gsheet_url", "")
 BASE_URL = "https://api.theracingapi.com/v1"
 
-st.set_page_config(page_title="Value Finder Pro V8.8", layout="wide")
+st.set_page_config(page_title="Value Finder Pro V8.9", layout="wide")
 
 # --- 2. ENGINES ---
 def get_race_category(race):
@@ -42,7 +42,8 @@ def get_advanced_score(r_data, race_going):
     return s, reasons
 
 def get_tissue_price(score):
-    return round(100 / (max(score, 0) + 12), 2)
+    # Neutral baseline: Score 0 = 12.0 (11/1)
+    return round(120 / (max(score, 0) + 10), 2)
 
 # --- 3. DATA OPS ---
 try:
@@ -65,7 +66,7 @@ app_mode = st.sidebar.radio("Active Engine:", ["Value Strategy", "Elite Performa
 
 st.sidebar.divider()
 st.sidebar.header("🛡️ Settings")
-min_score = st.sidebar.slider("Min Value Score", 0, 60, 0) # Set to 0 for maximum visibility
+min_score = st.sidebar.slider("Min Value Score", 0, 60, 0)
 min_gap = st.sidebar.slider("Min Gap % Filter", -100, 100, -100)
 show_all_races = st.sidebar.toggle("Show ALL Racecards", value=True)
 
@@ -76,7 +77,7 @@ tab1, tab2, tab3 = st.tabs(["🚀 Analysis", "📊 Ledger", "📈 Stats"])
 
 with tab1:
     if st.button('🚀 Run Analysis'):
-        with st.spinner("Fetching Data..."):
+        with st.spinner("Fetching Market Data..."):
             auth = HTTPBasicAuth(API_USER, API_PASS)
             r = requests.get(f"{BASE_URL}/racecards/standard", auth=auth)
             if r.status_code == 200:
@@ -88,16 +89,20 @@ with tab1:
                         score, reasons = get_advanced_score(r_data, going)
                         odds = float(r_data.get('sp_dec') or 1.0)
                         tissue = get_tissue_price(score)
-                        gap = round(((odds - tissue) / tissue) * 100, 1)
                         
-                        # --- MODIFIED LOGIC GATE ---
+                        # Gap Logic for SP vs Market Prices
+                        if odds <= 1.1:
+                            gap_val = 0.0
+                            gap_display = "Waiting for Odds..."
+                        else:
+                            gap_val = round(((odds - tissue) / tissue) * 100, 1)
+                            gap_display = f"{gap_val}%"
+                        
                         is_match = False
                         if app_mode == "Value Strategy":
-                            # Removed the odds >= 4.0 requirement so you can see SP (1.0) horses tonight
-                            if score >= min_score and gap >= min_gap: 
+                            if score >= min_score and gap_val >= min_gap: 
                                 is_match = True
                         else:
-                            # Elite Mode
                             if odds < 4.0 and score >= min_score: 
                                 is_match = True
                         
@@ -106,7 +111,8 @@ with tab1:
                                 "Date": datetime.now().strftime("%Y-%m-%d"),
                                 "Horse": r_data.get('horse'), "Course": race.get('course'),
                                 "Time": race.get('off_time'), "Odds": odds, "Score": score,
-                                "Gap": f"{gap}%", "Tag": app_mode, "Analysis": " | ".join(reasons)
+                                "Gap": gap_display, "gap_num": gap_val, "Tag": app_mode, 
+                                "Analysis": " | ".join(reasons)
                             })
                 st.session_state.value_horses = picks
             else:
@@ -124,17 +130,17 @@ with tab1:
             st.markdown(f"""
             <div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:2px solid #333; margin-bottom:10px;">
                 <span style="font-size:1.1em; font-weight:bold;">{h['Horse']}</span> - {h['Time']} {h['Course']}<br>
-                <b>Odds: {h['Odds']}</b> | Score: {h['Score']} | Gap: {h['Gap']}<br>
+                <b>Odds: {h['Odds']}</b> | Score: {h['Score']} | <b>Value Gap: {h['Gap']}</b><br>
                 <small>{h['Analysis'] if h['Analysis'] else 'No specific trends found'}</small>
             </div>
             """, unsafe_allow_html=True)
         
         if st.button("📤 Log Selections"):
             ledger = load_ledger()
-            new_df = pd.DataFrame(st.session_state.value_horses)
-            new_df['Result'] = 'Pending'
-            new_df['P/L'] = 0.0
-            updated = pd.concat([ledger, new_df], ignore_index=True).drop_duplicates(subset=['Horse', 'Date', 'Time'])
+            log_data = pd.DataFrame(st.session_state.value_horses).drop(columns=['gap_num'])
+            log_data['Result'] = 'Pending'
+            log_data['P/L'] = 0.0
+            updated = pd.concat([ledger, log_data], ignore_index=True).drop_duplicates(subset=['Horse', 'Date', 'Time'])
             conn.update(spreadsheet=GSHEET_URL, data=updated)
             st.success("Logged!")
 
@@ -167,3 +173,7 @@ with tab3:
                 pl = pd.to_numeric(settled['P/L'], errors='coerce').sum()
                 m3.metric("Total P/L", f"{pl:.2f} pts")
             except: pass
+        else:
+            st.info("Mark results as 'Winner' or 'Loser' in Sheets to update stats.")
+    else:
+        st.info("Stats tab will populate once you log your first picks.")
