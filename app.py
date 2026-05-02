@@ -69,11 +69,13 @@ st.sidebar.divider()
 st.sidebar.subheader("📈 Market Filters")
 require_steam = st.sidebar.checkbox("Require shortening odds / positive market move", value=False)
 allow_longshots_without_steam = st.sidebar.checkbox("Allow 10.0+ longshots without steam", value=True)
-strict_strategy_rules = st.sidebar.checkbox(
-    "Use strict semi-pro strategy rules",
-    value=False,
-    help="When off, the sidebar score/edge/odds filters decide qualifiers. When on, selections must also match Core Value / Longshot strategy rules."
+qualification_mode = st.sidebar.selectbox(
+    "Qualification Mode",
+    ["Testing: show anything passing odds", "Score + Edge", "Strict Semi-Pro"],
+    index=0,
+    help="Use Testing mode first to confirm runners display. Then move to Score + Edge or Strict Semi-Pro once the data is flowing."
 )
+strict_strategy_rules = qualification_mode == "Strict Semi-Pro"
 
 st.sidebar.divider()
 st.sidebar.subheader("💰 Staking")
@@ -455,36 +457,37 @@ def calculate_stake(base, odds, estimated_prob, edge):
 def qualifies_selection(strategy, odds, score, edge, market_move):
     """Final qualifier gate.
 
-    Important fix: the previous version hard-coded strategy requirements of score >= 30.
-    That meant the sidebar sliders could be set to 0 and still return no qualifiers.
-    This version respects your sidebar settings first, then optionally applies stricter strategy rules.
+    Testing mode deliberately ignores score and edge so you can confirm that API runners
+    and odds are being displayed before tightening the model filters.
     """
     if odds < min_odds or odds > max_odds:
-        return False
-    if score < min_score:
-        return False
-    if edge < min_edge:
         return False
 
     has_steam = not pd.isna(market_move) and market_move > 0
 
     if require_steam:
-        if has_steam:
-            return True
-        if allow_longshots_without_steam and odds >= 10:
-            return True
+        if not has_steam and not (allow_longshots_without_steam and odds >= 10):
+            return False
+
+    if qualification_mode == "Testing: show anything passing odds":
+        return True
+
+    if score < min_score:
+        return False
+    if pd.isna(edge) or edge < min_edge:
         return False
 
-    if strict_strategy_rules:
-        if odds >= 10 and score >= 30:
-            return True
-        if 5 <= odds < 10 and score >= 30 and has_steam:
-            return True
-        if score >= 35 and edge >= min_edge:
-            return True
-        return False
+    if qualification_mode == "Score + Edge":
+        return True
 
-    return True
+    # Strict Semi-Pro
+    if odds >= 10 and score >= 30:
+        return True
+    if 5 <= odds < 10 and score >= 30 and has_steam:
+        return True
+    if score >= 35 and edge >= min_edge:
+        return True
+    return False
 
 # =========================================================
 # 7. API FETCHING
@@ -530,15 +533,16 @@ def analyse_racecards(racecards):
                 failed_filters.append("Below min odds")
             if odds > max_odds:
                 failed_filters.append("Above max odds")
-            if score < min_score:
-                failed_filters.append("Below min score")
-            if edge < min_edge:
-                failed_filters.append("Below min edge")
+            if qualification_mode != "Testing: show anything passing odds":
+                if score < min_score:
+                    failed_filters.append("Below min score")
+                if pd.isna(edge) or edge < min_edge:
+                    failed_filters.append("Below min edge")
             if require_steam:
                 has_steam = not pd.isna(market_move) and market_move > 0
                 if not has_steam and not (allow_longshots_without_steam and odds >= 10):
                     failed_filters.append("No steam")
-            if strict_strategy_rules:
+            if qualification_mode == "Strict Semi-Pro":
                 has_steam = not pd.isna(market_move) and market_move > 0
                 strict_pass = (
                     (odds >= 10 and score >= 30) or
@@ -678,7 +682,7 @@ with tab1:
             d1, d2, d3, d4 = st.columns(4)
             d1.metric("Pass Odds", int(((df_all["Odds_Taken"] >= min_odds) & (df_all["Odds_Taken"] <= max_odds)).sum()))
             d2.metric("Pass Score", int((df_all["Score"] >= min_score).sum()))
-            d3.metric("Pass Edge", int((df_all["Edge"] >= min_edge).sum()))
+            d3.metric("Pass Edge", int((df_all["Edge"] >= min_edge).sum()) if qualification_mode != "Testing: show anything passing odds" else "Bypassed")
             d4.metric("Qualifiers", int(df_all["Qualifies"].sum()))
             if "Filter_Reason" in df_all.columns:
                 st.dataframe(
