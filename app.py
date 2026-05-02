@@ -60,11 +60,6 @@ min_score = st.sidebar.slider(
     25,
     5,
     help="Start around 20–25 while the model is being calibrated. Increase only after you have enough settled results."
-) min_edge = st.sidebar.slider(
-    "Minimum Edge",
-    -0.50,
-    0.25,
-    -0.05,rated. Increase only after you have enough settled results."
 )
 min_edge = st.sidebar.slider(
     "Minimum Edge",
@@ -72,17 +67,16 @@ min_edge = st.sidebar.slider(
     0.25,
     -0.05,
     0.01,
-    help="0.00 means only horses with non-negative estimated edge qualify. Use a negative value when testing to see all runners that pass score/odds filters."
+    help="0.00 means only horses with non-negative estimated edge qualify. Use a negative value when testing or calibrating the model."
 )
 min_odds = st.sidebar.number_input("Minimum Odds", min_value=1.01, value=5.0, step=0.5)
 max_odds = st.sidebar.number_input("Maximum Odds", min_value=1.01, value=40.0, step=1.0)
 
 st.sidebar.divider()
 st.sidebar.subheader("📈 Market Filters")
-require_steam = st.sidebar.checkbox("Require shortening odqualification_mode = st.sidebar.selectbox(
-    "Qualification Mode",
-    ["Testing: show anything passing odds", "Score + Edge", "Strict Semi-Pro"],
-    index=1,e = st.sidebar.selectbox(
+require_steam = st.sidebar.checkbox("Require shortening odds / positive market move", value=False)
+allow_longshots_without_steam = st.sidebar.checkbox("Allow 10.0+ longshots without steam", value=True)
+qualification_mode = st.sidebar.selectbox(
     "Qualification Mode",
     ["Testing: show anything passing odds", "Score + Edge", "Strict Semi-Pro"],
     index=1,
@@ -376,27 +370,11 @@ def get_advanced_score(runner: dict, race: dict) -> tuple[int, list[str], bool]:
             reasons.append("Quick Turnaround")
 
     # Weight / OR / age placeholders: safe if fields exist.
-    age = safe_num(# Signal stacking: reward stronger combinations rather than treating every signal as isolated.
-    reason_set = set(reasons)
-    if "LTO Winner" in reason_set and "Class Drop" in reason_set:
-        score += 8
-        reasons.append("Power Combo: LTO + Class Drop")
-
-    if "Trainer Hot" in reason_set and ("Course & Distance" in reason_set or "Course Winner" in reason_set):
-        score += 6
-        reasons.append("Power Combo: Hot Trainer + Track Fit")
-
-    if "Good Recency" in reason_set and ("Recent Placed Form" in reason_set or "LTO Winner" in reason_set):
-        score += 5
-        reasons.append("Power Combo: Fit + In Form")
-
-    if "Long Layoff" in reason_set and "Trainer Cold" in reason_set:
-        score -= 8
-        reasons.append("Risk Combo: Layoff + Cold Trainer")
-
-    # Keep score in sensible range
-    score = int(max(0, min(score, 100)))
-    return score, reasons, is_elite   reasons.append("Older Horse")
+    age = safe_num(runner.get("age"), np.nan)
+    if not pd.isna(age):
+        if age >= 10:
+            score -= 5
+            reasons.append("Older Horse")
 
     # Signal stacking: reward stronger combinations rather than treating every signal as isolated.
     reason_set = set(reasons)
@@ -446,7 +424,10 @@ def estimate_probability(score: float, odds: float, market_move=np.nan) -> float
 
     estimated = market_prob + score_adjustment + move_adjustment
 
-    # Softer universal cap. This prevents impossible probabilities without suppressing lon
+    # Softer universal cap. This prevents impossible probabilities without suppressing longshot edge.
+    estimated = min(estimated, 0.50)
+
+    return round(float(max(0.005, estimated)), 4)
 
 
 def calculate_edge(estimated_prob: float, odds: float) -> tuple[float, float]:
@@ -522,11 +503,11 @@ def qualifies_selection(strategy, odds, score, edge, market_move):
         return True
 
     # Strict Semi-Pro
-    if odds >= 10 and score >= 30:
+    if odds >= 10 and score >= 25:
         return True
-    if 5 <= odds < 10 and score >= 30 and has_steam:
+    if 5 <= odds < 10 and score >= 25 and has_steam:
         return True
-    if score >= 35 and edge >= min_edge:
+    if score >= 30 and edge >= min_edge:
         return True
     return False
 
@@ -586,9 +567,9 @@ def analyse_racecards(racecards):
             if qualification_mode == "Strict Semi-Pro":
                 has_steam = not pd.isna(market_move) and market_move > 0
                 strict_pass = (
-                    (odds >= 10 and score >= 30) or
-                    (5 <= odds < 10 and score >= 30 and has_steam) or
-                    (score >= 35 and edge >= min_edge)
+                    (odds >= 10 and score >= 25) or
+                    (5 <= odds < 10 and score >= 25 and has_steam) or
+                    (score >= 30 and edge >= min_edge)
                 )
                 if not strict_pass:
                     failed_filters.append("Strict rules")
@@ -725,6 +706,11 @@ with tab1:
             d2.metric("Pass Score", int((df_all["Score"] >= min_score).sum()))
             d3.metric("Pass Edge", int((df_all["Edge"] >= min_edge).sum()) if qualification_mode != "Testing: show anything passing odds" else "Bypassed")
             d4.metric("Qualifiers", int(df_all["Qualifies"].sum()))
+            st.caption(
+                f"Score range: {int(df_all['Score'].min())}–{int(df_all['Score'].max())} | "
+                f"Median score: {df_all['Score'].median():.1f} | "
+                f"Edge range: {df_all['Edge'].min():.1%} to {df_all['Edge'].max():.1%}"
+            )
             if "Filter_Reason" in df_all.columns:
                 st.dataframe(
                     df_all["Filter_Reason"].value_counts().reset_index().rename(columns={"index": "Filter Reason", "Filter_Reason": "Count"}),
