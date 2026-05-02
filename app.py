@@ -3,7 +3,7 @@ import pandas as pd
 import requests
 import re
 from requests.auth import HTTPBasicAuth
-from datetime import datetime, timedelta
+from datetime import datetime
 from streamlit_gsheets import GSheetsConnection
 
 # --- 1. SETTINGS & DATA MAPS ---
@@ -14,21 +14,15 @@ BASE_URL = "https://api.theracingapi.com/v1"
 
 ELITE_JOCKEYS = ["W Buick", "O Murphy", "J Doyle", "R Moore", "T Marquand", "H Doyle", "B Curtis", "L Morris"]
 
-COURSE_INFO = {
-    "Kempton": "Right", "Wolverhampton": "Left", "Southwell": "Left", 
-    "Chelmsford": "Left", "Lingfield": "Left", "Newcastle": "Straight",
-    "Ascot": "Right", "Sandown": "Right", "Chester": "Left", "Epsom": "Left",
-    "Doncaster": "Left", "York": "Left", "Goodwood": "Right", "Haydock": "Left"
-}
-
-st.set_page_config(page_title="Value Finder Pro V5.7", layout="wide")
-st.title("🏇 Value Finder Pro: Master Insights")
+st.set_page_config(page_title="Value Finder Pro V5.8", layout="wide")
+st.title("🏇 Value Finder Pro: Strategy Pivot")
 
 # --- 2. SIDEBAR ---
 st.sidebar.header("🛡️ Strategy Settings")
 race_filter = st.sidebar.selectbox("Race Type Filter", ["Handicaps Only", "All Race Types"], index=0)
 stake_input = st.sidebar.number_input("Base Stake (£)", min_value=1, value=5, step=1)
-min_score = st.sidebar.slider("Min Value Score", 0, 60, 25, 5)
+# Defaulted to 30 for better ROI
+min_score = st.sidebar.slider("Min Value Score", 0, 60, 30, 5)
 
 st.sidebar.divider()
 st.sidebar.subheader("💎 Value Protection")
@@ -67,37 +61,28 @@ def get_advanced_score(r_data, race_data):
         last_class = pd.to_numeric(r_data.get('last_class'), errors='coerce')
         if curr_class and last_class and curr_class > last_class: 
             s += 10
-            reasons.append(f"📉 Class Drop (C{int(last_class)} -> C{int(curr_class)})")
+            reasons.append(f"📉 Class Drop")
 
         headgear = str(r_data.get('headgear', '')).lower()
         if '1' in headgear:
             s += 10
-            reasons.append(f"🎭 1st Time Headgear ({headgear.upper()})")
+            reasons.append(f"🎭 1st Headgear")
 
         t_stats = r_data.get('trainer_14_days', {})
         if isinstance(t_stats, dict):
             win_pc = pd.to_numeric(t_stats.get('percent', 0), errors='coerce') or 0
-            runs = pd.to_numeric(t_stats.get('runs', 0), errors='coerce') or 0
             if win_pc >= 20: 
                 s += 15
-                reasons.append(f"🔥 Trainer Hot ({int(win_pc)}%)")
-            elif win_pc == 0 and runs >= 5:
-                s -= 10
-                reasons.append("❄️ Trainer Cold (0% in 14d)")
+                reasons.append(f"🔥 Trainer Hot")
 
         jky = str(r_data.get('jockey', ''))
         is_elite = any(elite in jky for elite in ELITE_JOCKEYS)
         if is_elite:
             s += 10
-            reasons.append(f"🏇 Elite Jockey: {jky}")
+            reasons.append(f"🏇 Elite Jockey")
 
         cd_flag = str(r_data.get('cd', '')).upper()
-        if 'CD' in cd_flag: s += 10; reasons.append("🎯 Course & Distance")
-        
-        curr_w = pd.to_numeric(r_data.get('weight_lbs'), errors='coerce')
-        last_w = pd.to_numeric(r_data.get('last_weight_lbs'), errors='coerce')
-        if curr_w and last_w and (last_w - curr_w >= 3):
-            s += 5; reasons.append(f"⚖️ Weight Drop (-{int(last_w - curr_w)}lbs)")
+        if 'CD' in cd_flag: s += 10; reasons.append("🎯 C&D")
     except: pass
     return s, reasons, is_elite
 
@@ -113,7 +98,7 @@ tab1, tab2 = st.tabs(["🚀 Market Analysis", "📊 Ledger"])
 
 with tab1:
     if st.button('🚀 Run Analysis'):
-        with st.spinner("Analyzing markets and applying shields..."):
+        with st.spinner("Calculating Strategy Pivots..."):
             auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
             r = requests.get(f"{BASE_URL}/racecards/standard", auth=auth)
             if r.status_code == 200:
@@ -128,10 +113,7 @@ with tab1:
                     for r_data in race.get('runners', []):
                         score, reasons, is_elite = get_advanced_score(r_data, race)
                         odds = get_safe_odds(r_data)
-                        p_odds = ((odds - 1) / 5) + 1
-                        
-                        # Bankroll Shield Logic
-                        if min_place_return and p_odds < 2.0: continue
+                        p_odds = ((odds - 1) / 4) + 1 # Calculation for Top 4 (1/4 odds)
                         
                         if score >= min_score and odds >= 5.0:
                             st.session_state.value_horses.append({
@@ -143,24 +125,42 @@ with tab1:
                                 "Score": score, 
                                 "Place_Odds": round(p_odds, 2),
                                 "Stake": stake_input,
-                                "Analysis": reasons, # Restored reasons
+                                "Analysis": reasons,
                                 "Elite": is_elite
                             })
                 st.success("Analysis Complete.")
 
     if st.session_state.value_horses:
         st.divider()
-        st.subheader("🎯 High-Probability Selections")
+        st.subheader("🎯 Strategy-Specific Selections")
         sorted_val = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)
         vcols = st.columns(min(len(sorted_val), 4))
+        
         for i, h in enumerate(sorted_val[:4]):
             with vcols[i]:
+                # THE PIVOT LOGIC
+                if h['Place_Odds'] < 2.0:
+                    strat_label = "🥈 TOP 2 TARGET"
+                    strat_color = "#E5E4E2" # Silver
+                    advice = "Low T4 Value. Split Win/Top 2 Exchange."
+                else:
+                    strat_label = "🏆 80/20 VALUE"
+                    strat_color = "#FFD700" # Gold
+                    advice = "Good T4 odds. Standard 80/20 Bookie."
+                
                 is_triple = h['Score'] >= 35 and h['Elite']
-                color = "#FFD700" if is_triple else "#f0f2f6"
-                st.markdown(f"""<div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:2px solid #333; text-align:center;">
-                <h2 style='margin:0;'>{h['Horse']}</h2><b>{h['Time']} - {h['Course']}</b><br>Score: {h['Score']} | Win: {h['Odds']} | Place: {h['Place_Odds']}
-                <br><small>{' | '.join(h['Analysis'])}</small>
-                {"<br>⭐ <b>TRIPLE SIGNAL</b>" if is_triple else ""}</div>""", unsafe_allow_html=True)
+                border = "4px solid #000" if is_triple else "1px solid #333"
+
+                st.markdown(f"""
+                <div style="background-color:{strat_color}; padding:15px; border-radius:10px; color:#000; border:{border}; text-align:center; min-height:220px;">
+                    <h3 style='margin:0;'>{h['Horse']}</h3>
+                    <b>{h['Time']} - {h['Course']}</b><br>
+                    <hr style='margin:10px 0;'>
+                    <b style='font-size:1.1em;'>{strat_label}</b><br>
+                    Win: {h['Odds']} | Place: {h['Place_Odds']}<br>
+                    <small style='color:#333;'>{advice}</small><br>
+                    <small>{' | '.join(h['Analysis'])}</small>
+                </div>""", unsafe_allow_html=True)
         
         if st.button("📤 LOG SELECTIONS"):
             ledger = load_ledger()
@@ -181,42 +181,20 @@ with tab1:
     if st.session_state.all_races:
         st.divider()
         st.header("🏁 Detailed Race Analysis")
-        f_count = 0
         for race in st.session_state.all_races:
             is_hcap = "Handicap" in str(race.get('race_name', ''))
             if race_filter == "Handicaps Only" and not is_hcap: continue
             
-            # --- FIXED FILTER LOGIC ---
-            # Determine if this specific race has ANY runners that pass the filters
-            valid_in_race = []
-            for r in race.get('runners', []):
-                s, reasons, e = get_advanced_score(r, race)
-                o = get_safe_odds(r)
-                p = ((o - 1) / 5) + 1
-                if s >= min_score and o >= 5.0 and (not min_place_return or p >= 2.0):
-                    valid_in_race.append({'r': r, 's': s, 'o': o, 'p': p, 'reasons': reasons})
-
+            valid_in_race = [r for r in race.get('runners', []) if get_advanced_score(r, race)[0] >= min_score and get_safe_odds(r) >= 5.0]
             if hide_low_value and not valid_in_race: continue
             
-            f_count += 1
-            direction = next((v for k, v in COURSE_INFO.items() if k in str(race.get('course'))), "Straight")
-            with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')} ({direction})"):
-                # Show all runners, but highlight the valid ones
+            with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')}"):
                 for r in race.get('runners', []):
-                    s, reasons, e = get_advanced_score(r, race)
+                    s, reasons, _ = get_advanced_score(r, race)
                     o = get_safe_odds(r)
-                    p_odds = round(((o - 1) / 5) + 1, 2)
-                    is_val = any(v['r']['horse'] == r.get('horse') for v in valid_in_race)
-                    
-                    if hide_low_value and not is_val: continue
-                    
-                    c1, c2, c3, c4 = st.columns([2, 1, 1, 3])
-                    c1.write(f"**{r.get('horse')}**")
-                    c2.write(f"Score: {s}")
-                    c3.write(f"W: {o} | P: {p_odds}")
-                    if is_val: c4.write("💎 **PRO VALUE** | " + " | ".join(reasons))
-                    elif reasons: c4.caption(" | ".join(reasons))
-        if f_count == 0: st.info("No races match your combined Score and Bankroll Shield filters.")
+                    p = round(((o - 1) / 4) + 1, 2)
+                    if hide_low_value and (s < min_score or o < 5.0): continue
+                    st.write(f"**{r.get('horse')}** | Score: {s} | W: {o} | P: {p} | {', '.join(reasons)}")
 
 with tab2:
     st.subheader("Performance Ledger")
