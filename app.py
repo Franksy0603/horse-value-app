@@ -11,39 +11,29 @@ API_PASS = st.secrets.get("API_PASS", "")
 GSHEET_URL = st.secrets.get("gsheet_url", "")
 BASE_URL = "https://api.theracingapi.com/v1"
 
-st.set_page_config(page_title="Value Finder Pro V8.9", layout="wide")
+st.set_page_config(page_title="Value Finder Pro V10.0", layout="wide")
 
-# --- 2. ENGINES ---
-def get_race_category(race):
-    is_jumps = race.get('jumps', '')
-    race_type = str(race.get('type', '')).lower()
-    surface = str(race.get('surface', '')).upper()
-    if is_jumps and len(str(is_jumps).strip()) > 0: return "Jumps"
-    if "flat" in race_type:
-        return "Flat (AW)" if ("AW" in surface or "STANDARD" in surface) else "Flat (Turf)"
-    return "Flat (Turf)"
+# --- 2. BASIC ENGINES ---
+def calculate_minimum_price(score):
+    """Simple calculation for Minimum Acceptable Price based on score."""
+    return round((1 / (score / 100)) + 0.1, 2) if score > 0 else 999.0
 
-def get_advanced_score(r_data, race_going):
+def get_simple_score(r_data):
+    """Core metrics, returning a single integer score and a list of reasons."""
     s = 0
     reasons = []
-    try:
-        form = str(r_data.get('form', ''))
-        if form.endswith('1'): 
-            s += 15; reasons.append("✅ LTO Winner")
-        cd = str(r_data.get('cd', '')).upper()
-        if 'C' in cd: s += 10; reasons.append("🎯 Course Form")
-        if 'D' in cd: s += 5; reasons.append("🏁 Distance Form")
-        current_g = str(race_going).upper()
-        past_g = str(r_data.get('going', '')).upper()
-        if len(current_g) > 2 and current_g in past_g:
-            s += 5; reasons.append("🌍 Ground Match")
-    except:
-        pass 
+    
+    # 1. LTO Winner
+    if str(r_data.get('form', '')).endswith('1'): 
+        s += 30; reasons.append("✅ LTO Winner")
+    
+    # 2. Course/Distance (CD)
+    cd = str(r_data.get('cd', '')).upper()
+    if 'CD' in cd: s += 30; reasons.append("🎯 Course & Distance Form")
+    elif 'C' in cd: s += 15; reasons.append("🏁 Course Form")
+    elif 'D' in cd: s += 15; reasons.append("🏁 Distance Form")
+    
     return s, reasons
-
-def get_tissue_price(score):
-    # Neutral baseline: Score 0 = 12.0 (11/1)
-    return round(120 / (max(score, 0) + 10), 2)
 
 # --- 3. DATA OPS ---
 try:
@@ -66,114 +56,72 @@ app_mode = st.sidebar.radio("Active Engine:", ["Value Strategy", "Elite Performa
 
 st.sidebar.divider()
 st.sidebar.header("🛡️ Settings")
-min_score = st.sidebar.slider("Min Value Score", 0, 60, 0)
-min_gap = st.sidebar.slider("Min Gap % Filter", -100, 100, -100)
-show_all_races = st.sidebar.toggle("Show ALL Racecards", value=True)
+min_score = st.sidebar.slider("Min Value Score", 0, 100, 30)
+odds_floor = st.sidebar.slider("Minimum Acceptable Odds (Decimal)", 1.1, 100.0, 1.1)
 
 if 'all_races' not in st.session_state: st.session_state.all_races = []
 if 'value_horses' not in st.session_state: st.session_state.value_horses = []
 
-tab1, tab2, tab3 = st.tabs(["🚀 Analysis", "📊 Ledger", "📈 Stats"])
+tab1, tab2 = st.tabs(["🚀 Market Analysis", "📊 Ledger"])
 
 with tab1:
     if st.button('🚀 Run Analysis'):
-        with st.spinner("Fetching Market Data..."):
+        with st.spinner("Analyzing Every Runner..."):
             auth = HTTPBasicAuth(API_USER, API_PASS)
             r = requests.get(f"{BASE_URL}/racecards/standard", auth=auth)
             if r.status_code == 200:
                 st.session_state.all_races = r.json().get('racecards', [])
                 picks = []
                 for race in st.session_state.all_races:
-                    going = race.get('going', 'N/A')
                     for r_data in race.get('runners', []):
-                        score, reasons = get_advanced_score(r_data, going)
-                        odds = float(r_data.get('sp_dec') or 1.0)
-                        tissue = get_tissue_price(score)
+                        # 1. Calculate Simple Score
+                        score, reasons = get_simple_score(r_data)
                         
-                        # Gap Logic for SP vs Market Prices
-                        if odds <= 1.1:
-                            gap_val = 0.0
-                            gap_display = "Waiting for Odds..."
-                        else:
-                            gap_val = round(((odds - tissue) / tissue) * 100, 1)
-                            gap_display = f"{gap_val}%"
+                        # 2. Get Minimum Acceptable Price
+                        min_price = calculate_minimum_price(score)
+                        
+                        # 3. Assess the Value based on simple logic
+                        odds = float(r_data.get('sp_dec') or 1.0)
                         
                         is_match = False
                         if app_mode == "Value Strategy":
-                            if score >= min_score and gap_val >= min_gap: 
-                                is_match = True
+                            if odds >= min_price and score >= min_score and odds >= odds_floor: is_match = True
                         else:
-                            if odds < 4.0 and score >= min_score: 
-                                is_match = True
+                            # Simple Elite Check
+                            if odds < 4.0 and score >= min_score: is_match = True
                         
                         if is_match:
                             picks.append({
                                 "Date": datetime.now().strftime("%Y-%m-%d"),
                                 "Horse": r_data.get('horse'), "Course": race.get('course'),
                                 "Time": race.get('off_time'), "Odds": odds, "Score": score,
-                                "Gap": gap_display, "gap_num": gap_val, "Tag": app_mode, 
-                                "Analysis": " | ".join(reasons)
+                                "Min Price": min_price, "Tag": app_mode, "Analysis": " | ".join(reasons)
                             })
                 st.session_state.value_horses = picks
             else:
                 st.error(f"API Error: {r.status_code}")
 
-    if st.session_state.all_races:
-        c1, c2 = st.columns(2)
-        c1.metric("Races Scanned", len(st.session_state.all_races))
-        c2.metric("Qualifiers Found", len(st.session_state.value_horses))
-
+    # Display Top Picks using simple color rows
     if st.session_state.value_horses:
-        st.divider()
+        st.subheader(f"🎯 Qualifying {app_mode} Selections ({len(st.session_state.value_horses)})")
         for h in st.session_state.value_horses:
-            color = "#FFD700" if h['Tag'] == "Value Strategy" else "#00FFCC"
+            color = "#D4AF37" if h['Tag'] == "Value Strategy" else "#2ECC71"
             st.markdown(f"""
-            <div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:2px solid #333; margin-bottom:10px;">
+            <div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:1px solid #333; margin-bottom:10px;">
                 <span style="font-size:1.1em; font-weight:bold;">{h['Horse']}</span> - {h['Time']} {h['Course']}<br>
-                <b>Odds: {h['Odds']}</b> | Score: {h['Score']} | <b>Value Gap: {h['Gap']}</b><br>
-                <small>{h['Analysis'] if h['Analysis'] else 'No specific trends found'}</small>
+                <b>Odds: {h['Odds']}</b> | Score: {h['Score']} | My Price: {h['Min Price']}<br>
+                <small>{h['Analysis']}</small>
             </div>
             """, unsafe_allow_html=True)
         
-        if st.button("📤 Log Selections"):
+        if st.button("📤 Log to Sheets"):
             ledger = load_ledger()
-            log_data = pd.DataFrame(st.session_state.value_horses).drop(columns=['gap_num'])
-            log_data['Result'] = 'Pending'
-            log_data['P/L'] = 0.0
-            updated = pd.concat([ledger, log_data], ignore_index=True).drop_duplicates(subset=['Horse', 'Date', 'Time'])
+            new_df = pd.DataFrame(st.session_state.value_horses)
+            new_df['Result'] = 'Pending'
+            new_df['P/L'] = 0.0
+            updated = pd.concat([ledger, new_df], ignore_index=True).drop_duplicates(subset=['Horse', 'Date', 'Time'])
             conn.update(spreadsheet=GSHEET_URL, data=updated)
-            st.success("Logged!")
-
-    if st.session_state.all_races:
-        st.divider()
-        for race in st.session_state.all_races:
-            race_picks = [p['Horse'] for p in st.session_state.value_horses if p['Time'] == race['off_time'] and p['Course'] == race['course']]
-            if show_all_races or race_picks:
-                with st.expander(f"🕒 {race['off_time']} - {race['course']} {'⭐' if race_picks else ''}"):
-                    for r in race['runners']:
-                        h_name = r.get('horse')
-                        is_sel = h_name in race_picks
-                        style = "color: green; font-weight: bold;" if is_sel else "color: gray;"
-                        st.markdown(f"<span style='{style}'>{h_name}</span> | Odds: {r.get('sp_dec')}", unsafe_allow_html=True)
+            st.success("Log Updated!")
 
 with tab2:
     st.dataframe(load_ledger(), use_container_width=True)
-
-with tab3:
-    st.header("📈 Strategy Stats")
-    df = load_ledger()
-    if not df.empty and 'Result' in df.columns:
-        settled = df[df['Result'].str.lower().isin(['winner', 'loser'])].copy()
-        if not settled.empty:
-            m1, m2, m3 = st.columns(3)
-            wins = len(settled[settled['Result'].str.lower() == 'winner'])
-            m1.metric("Total Bets", len(settled))
-            m2.metric("Strike Rate", f"{(wins/len(settled)*100):.1f}%")
-            try:
-                pl = pd.to_numeric(settled['P/L'], errors='coerce').sum()
-                m3.metric("Total P/L", f"{pl:.2f} pts")
-            except: pass
-        else:
-            st.info("Mark results as 'Winner' or 'Loser' in Sheets to update stats.")
-    else:
-        st.info("Stats tab will populate once you log your first picks.")
