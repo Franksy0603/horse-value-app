@@ -11,23 +11,22 @@ API_PASS = st.secrets.get("API_PASS", "")
 GSHEET_URL = st.secrets.get("gsheet_url", "")
 BASE_URL = "https://api.theracingapi.com/v1"
 
-st.set_page_config(page_title="Value Finder Pro V10.1", layout="wide")
+st.set_page_config(page_title="Value Finder Pro V10.2", layout="wide")
 
-# --- 2. BASIC ENGINES ---
+# --- 2. ENGINES ---
 def calculate_minimum_price(score):
-    """Simple calculation for Minimum Acceptable Price based on score."""
-    # Logic: Higher score = lower required price. 
-    # Example: Score 30 needs odds of 3.43+. Score 60 needs odds of 1.76+.
-    return round((100 / max(score, 1)) + 0.1, 2) if score > 0 else 20.0
+    """If score is 0, any price is fine (1.1). Otherwise, calculate required odds."""
+    if score <= 0:
+        return 1.1
+    # Example: Score 20 -> 5.0, Score 50 -> 2.0
+    return round(100 / score, 2)
 
 def get_simple_score(r_data):
-    """Core metrics only."""
     s = 0
     reasons = []
-    # LTO Winner
-    if str(r_data.get('form', '')).endswith('1'): 
+    form = str(r_data.get('form', ''))
+    if form.endswith('1'): 
         s += 30; reasons.append("✅ LTO Winner")
-    # Course/Distance
     cd = str(r_data.get('cd', '')).upper()
     if 'CD' in cd: s += 30; reasons.append("🎯 Course & Distance")
     elif 'C' in cd: s += 15; reasons.append("🏁 Course Form")
@@ -55,8 +54,8 @@ app_mode = st.sidebar.radio("Active Engine:", ["Value Strategy", "Elite Performa
 
 st.sidebar.divider()
 st.sidebar.header("🛡️ Settings")
-min_score = st.sidebar.slider("Min Value Score", 0, 100, 30)
-odds_floor = st.sidebar.slider("Minimum Odds (Filter)", 1.1, 20.0, 1.1)
+min_score_input = st.sidebar.slider("Min Value Score", 0, 100, 0)
+odds_floor_input = st.sidebar.slider("Minimum Odds Filter", 1.1, 20.0, 1.1)
 
 if 'all_races' not in st.session_state: st.session_state.all_races = []
 if 'value_horses' not in st.session_state: st.session_state.value_horses = []
@@ -65,24 +64,31 @@ tab1, tab2 = st.tabs(["🚀 Market Analysis", "📊 Ledger"])
 
 with tab1:
     if st.button('🚀 Run Analysis'):
-        with st.spinner("Analyzing Runners..."):
+        with st.spinner("Connecting to API..."):
             auth = HTTPBasicAuth(API_USER, API_PASS)
             r = requests.get(f"{BASE_URL}/racecards/standard", auth=auth)
+            
             if r.status_code == 200:
                 st.session_state.all_races = r.json().get('racecards', [])
                 picks = []
+                total_runners_scanned = 0
+                
                 for race in st.session_state.all_races:
                     for r_data in race.get('runners', []):
+                        total_runners_scanned += 1
                         score, reasons = get_simple_score(r_data)
                         min_p = calculate_minimum_price(score)
                         odds = float(r_data.get('sp_dec') or 1.0)
                         
+                        # Logic Gate
                         is_match = False
                         if app_mode == "Value Strategy":
-                            if odds >= min_p and score >= min_score and odds >= odds_floor:
+                            # Must meet score AND odds must be higher than our calculated min price
+                            if score >= min_score_input and odds >= min_p and odds >= odds_floor_input:
                                 is_match = True
                         else: # Elite Performance
-                            if odds < 5.0 and score >= min_score:
+                            # Simply look for high scores regardless of value gap
+                            if score >= min_score_input and score > 0:
                                 is_match = True
                         
                         if is_match:
@@ -93,22 +99,24 @@ with tab1:
                                 "Time": race.get('off_time'),
                                 "Odds": odds,
                                 "Score": score,
-                                "Min Price": min_p, # Fixed: Now always exists
+                                "Min Price": min_p,
                                 "Tag": app_mode,
-                                "Analysis": " | ".join(reasons)
+                                "Analysis": " | ".join(reasons) if reasons else "No specific trends"
                             })
+                
                 st.session_state.value_horses = picks
+                st.info(f"Scan Complete: Checked {total_runners_scanned} horses across {len(st.session_state.all_races)} races.")
             else:
-                st.error(f"API Error: {r.status_code}")
+                st.error(f"API Error: {r.status_code}. Check your secrets/credentials.")
 
+    # Display results
     if st.session_state.value_horses:
-        st.subheader(f"🎯 Qualifiers ({len(st.session_state.value_horses)})")
         for h in st.session_state.value_horses:
             color = "#FFD700" if h['Tag'] == "Value Strategy" else "#00FFCC"
             st.markdown(f"""
             <div style="background-color:{color}; padding:15px; border-radius:10px; color:#000; border:1px solid #333; margin-bottom:10px;">
                 <span style="font-size:1.1em; font-weight:bold;">{h['Horse']}</span> - {h['Time']} {h['Course']}<br>
-                <b>Odds: {h['Odds']}</b> | Score: {h['Score']} | <b>Min Price: {h['Min Price']}</b><br>
+                <b>Odds: {h['Odds']}</b> | Score: {h['Score']} | Target Price: {h['Min Price']}<br>
                 <small>{h['Analysis']}</small>
             </div>
             """, unsafe_allow_html=True)
@@ -119,7 +127,9 @@ with tab1:
             new_df['Result'] = 'Pending'; new_df['P/L'] = 0.0
             updated = pd.concat([ledger, new_df], ignore_index=True).drop_duplicates(subset=['Horse', 'Date', 'Time'])
             conn.update(spreadsheet=GSHEET_URL, data=updated)
-            st.success("Log Updated!")
+            st.success("Successfully logged!")
+    elif st.session_state.all_races:
+        st.warning("No horses met your current filter settings. Try lowering the 'Min Value Score'.")
 
 with tab2:
     st.dataframe(load_ledger(), use_container_width=True)
