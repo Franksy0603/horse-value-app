@@ -85,6 +85,30 @@ qualification_mode = st.sidebar.selectbox(
 strict_strategy_rules = qualification_mode == "Strict Semi-Pro"
 
 st.sidebar.divider()
+st.sidebar.subheader("🧠 Auto-Calibration")
+use_auto_calibration = st.sidebar.checkbox(
+    "Use ledger-based calibration",
+    value=True,
+    help="Uses your settled ledger results to adjust estimated probabilities by score band and odds band. Falls back to heuristic estimates when sample size is too small."
+)
+min_calibration_samples = st.sidebar.slider(
+    "Min samples per calibration bucket",
+    5,
+    100,
+    20,
+    5,
+    help="Lower values react faster but are noisier. Use 20+ once you have enough results."
+)
+calibration_blend = st.sidebar.slider(
+    "Calibration strength",
+    0.0,
+    1.0,
+    0.50,
+    0.05,
+    help="0 = heuristic only. 1 = calibration only. 0.5 is a sensible starting point."
+)
+
+st.sidebar.divider()
 st.sidebar.subheader("💰 Staking")
 staking_mode = st.sidebar.selectbox("Staking Mode", ["Flat Stake", "Edge Weighted", "Fractional Kelly Lite"], index=1)
 max_stake_multiplier = st.sidebar.slider("Max Stake Multiplier", 1.0, 5.0, 2.0, 0.25)
@@ -285,7 +309,135 @@ def market_move_band(move) -> str:
     return "Strong Drift"
 
 # =========================================================
-# 6. SCORING ENGINE
+# 6. AUTO-CALIBRATION ENGINE
+# =========================================================
+
+def is_win_result(value) -> bool:
+    txt = str(value or "").strip().lower()
+    return txt in ["win", "won", "winner", "1", "1st"]
+
+
+def build_calibration_tables(ledger: pd.DataFrame):
+    """Build empirical win-rate tables from settled ledger results.
+
+    Priority order during prediction:
+    1. Score band + odds band
+    2. Score band only
+    3. Odds band only
+    4. Overall ledger win rate
+
+    Each table includes sample size, win rate and average odds so the app can avoid trusting tiny buckets too much.
+    """
+    ledger = prepare_numeric_ledger(ledger)
+    if ledger.empty:
+        return {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None
+
+    settled = ledger[ledger["Result"].astype(str).str.lower().ne("pending")].copy()
+    settled = settled.dropna(subset=["Score", "Odds_Taken"])
+
+    if settled.empty:
+        return {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None
+
+    settled["Win_Flag"] = settled["Result"].apply(is_win_result).astype(int)
+    settled["Score_Band"] = settled["Score"].apply(score_band)
+    settled["Odds_Band"] = settled["Odds_Taken"].apply(odds_band)
+
+    overall = {
+        "samples": int(len(settled)),
+        "win_rate": float(settled["Win_Flag"].mean()),
+        "avg_odds": float(settled["Odds_Taken"].mean()),
+    }
+
+    combo = settled.groupby(["Score_Band", "Odds_Band"]).agg(
+        Samples=("Win_Flag", "count"),
+        Wins=("Win_Flag", "sum"),
+        Win_Rate=("Win_Flag", "mean"),
+        Avg_Odds=("Odds_Taken", "mean"),
+        PL=("P/L", "sum"),
+        Staked=("Stake", "sum"),
+    ).reset_index()
+
+    score_tbl = settled.groupby("Score_Band").agg(
+        Samples=("Win_Flag", "count"),
+        Wins=("Win_Flag", "sum"),
+        Win_Rate=("Win_Flag", "mean"),
+        Avg_Odds=("Odds_Taken", "mean"),
+        PL=("P/L", "sum"),
+        Staked=("Stake", "sum"),
+    ).reset_index()
+
+    odds_tbl = settled.groupby("Odds_Band").agg(
+        Samples=("Win_Flag", "count"),
+        Wins=("Win_Flag", "sum"),
+        Win_Rate=("Win_Flag", "mean"),
+        Avg_Odds=("Odds_Taken", "mean"),
+        PL=("P/L", "sum"),
+        Staked=("Stake", "sum"),
+    ).reset_index()
+
+    for table in [combo, score_tbl, odds_tbl]:
+        if not table.empty:
+            table["ROI"] = np.where(table["Staked"] > 0, table["PL"] / table["Staked"], np.nan)
+            table["Win_Rate"] = table["Win_Rate"].round(4)
+            table["Avg_Odds"] = table["Avg_Odds"].round(2)
+            table["ROI"] = table["ROI"].round(3)
+
+    return {}, combo, score_tbl, odds_tbl, overall
+
+
+def lookup_calibrated_probability(score, odds, heuristic_prob, combo_tbl, score_tbl, odds_tbl, overall):
+    """Blend heuristic probability with empirical ledger probability.
+
+    Uses simple Bayesian smoothing so tiny samples do not create extreme probabilities.
+    """
+    if not use_auto_calibration or overall is None:
+        return heuristic_prob, "Heuristic only"
+
+    sb = score_band(score)
+    ob = odds_band(odds)
+
+    candidates = []
+
+    if combo_tbl is not None and not combo_tbl.empty:
+        row = combo_tbl[(combo_tbl["Score_Band"] == sb) & (combo_tbl["Odds_Band"] == ob)]
+        if not row.empty:
+            r = row.iloc[0]
+            candidates.append(("Score+Odds bucket", int(r["Samples"]), float(r["Win_Rate"])))
+
+    if score_tbl is not None and not score_tbl.empty:
+        row = score_tbl[score_tbl["Score_Band"] == sb]
+        if not row.empty:
+            r = row.iloc[0]
+            candidates.append(("Score bucket", int(r["Samples"]), float(r["Win_Rate"])))
+
+    if odds_tbl is not None and not odds_tbl.empty:
+        row = odds_tbl[odds_tbl["Odds_Band"] == ob]
+        if not row.empty:
+            r = row.iloc[0]
+            candidates.append(("Odds bucket", int(r["Samples"]), float(r["Win_Rate"])))
+
+    candidates.append(("Overall ledger", int(overall["samples"]), float(overall["win_rate"])))
+
+    chosen_label, samples, raw_rate = candidates[-1]
+    for label, n, rate in candidates:
+        if n >= min_calibration_samples:
+            chosen_label, samples, raw_rate = label, n, rate
+            break
+
+    # Bayesian smoothing toward market/heuristic to avoid overreacting.
+    prior_strength = max(10, min_calibration_samples)
+    smoothed_rate = ((raw_rate * samples) + (heuristic_prob * prior_strength)) / (samples + prior_strength)
+
+    # Blend with heuristic. This lets calibration improve the model gradually.
+    calibrated = (heuristic_prob * (1 - calibration_blend)) + (smoothed_rate * calibration_blend)
+
+    # Safety cap/floor.
+    calibrated = min(max(calibrated, 0.005), 0.50)
+    source = f"{chosen_label} ({samples} samples, raw {raw_rate:.1%})"
+    return round(float(calibrated), 4), source
+
+# =========================================================
+# 7. SCORING ENGINE
 # =========================================================
 
 
@@ -512,7 +664,7 @@ def qualifies_selection(strategy, odds, score, edge, market_move):
     return False
 
 # =========================================================
-# 7. API FETCHING
+# 8. API FETCHING
 # =========================================================
 
 
@@ -526,6 +678,9 @@ def fetch_racecards():
 
 def analyse_racecards(racecards):
     selections = []
+
+    ledger_for_calibration = load_ledger()
+    _, combo_tbl, score_tbl, odds_tbl, overall_calibration = build_calibration_tables(ledger_for_calibration)
 
     for race in racecards:
         race_name = str(race.get("race_name", "") or "")
@@ -543,7 +698,10 @@ def analyse_racecards(racecards):
 
             score, reasons, is_elite = get_advanced_score(runner, race)
             implied_prob = round(1 / odds, 4)
-            estimated_prob = estimate_probability(score, odds, market_move)
+            heuristic_prob = estimate_probability(score, odds, market_move)
+            estimated_prob, calibration_source = lookup_calibrated_probability(
+                score, odds, heuristic_prob, combo_tbl, score_tbl, odds_tbl, overall_calibration
+            )
             edge, ev = calculate_edge(estimated_prob, odds)
             strategy = assign_strategy(score, odds, edge, market_move)
             stake = calculate_stake(base_stake, odds, estimated_prob, edge)
@@ -590,6 +748,8 @@ def analyse_racecards(racecards):
                 "Odds_Band": odds_band(odds),
                 "Implied_Prob": implied_prob,
                 "Estimated_Prob": estimated_prob,
+                "Heuristic_Prob": heuristic_prob,
+                "Calibration_Source": calibration_source,
                 "Edge": edge,
                 "EV": ev,
                 "Market_Move": market_move,
@@ -601,7 +761,7 @@ def analyse_racecards(racecards):
                 "Return": 0.0,
                 "P/L": 0.0,
                 "Reason_Tags": " | ".join(reasons),
-                "Notes": f"Odds source: {odds_source}",
+                "Notes": f"Odds source: {odds_source}; Calibration: {calibration_source}",
                 "Filter_Reason": "Pass" if qualifies else " | ".join(failed_filters),
                 "Elite": is_elite,
                 "Qualifies": qualifies,
@@ -611,7 +771,7 @@ def analyse_racecards(racecards):
     return selections
 
 # =========================================================
-# 8. PERFORMANCE ANALYSIS
+# 9. PERFORMANCE ANALYSIS
 # =========================================================
 
 
@@ -650,8 +810,8 @@ def performance_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
 # 9. UI TABS
 # =========================================================
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🚀 Market Analysis", "📊 Ledger", "📈 Performance", "🧪 Debug / API Fields"
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🚀 Market Analysis", "📊 Ledger", "📈 Performance", "🧠 Calibration", "🧪 Debug / API Fields"
 ])
 
 with tab1:
@@ -748,7 +908,7 @@ with tab1:
             st.subheader("Selection Table")
             display_cols = [
                 "Qualifies", "Horse", "Course", "Time", "Strategy", "Odds_Taken", "Opening_Odds",
-                "Market_Move", "Score", "Implied_Prob", "Estimated_Prob", "Edge", "EV", "Stake", "Filter_Reason", "Reason_Tags"
+                "Market_Move", "Score", "Implied_Prob", "Heuristic_Prob", "Estimated_Prob", "Edge", "EV", "Stake", "Calibration_Source", "Filter_Reason", "Reason_Tags"
             ]
             st.dataframe(df_show[display_cols], use_container_width=True)
 
@@ -832,6 +992,46 @@ with tab3:
                 st.dataframe(summary, use_container_width=True)
 
 with tab4:
+    st.subheader("🧠 Auto-Calibration")
+    ledger = load_ledger()
+    _, combo_tbl, score_tbl, odds_tbl, overall = build_calibration_tables(ledger)
+
+    if overall is None:
+        st.info("No settled results available yet. Calibration will use the heuristic probability model only.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Settled calibration sample", overall["samples"])
+        c2.metric("Overall win rate", f"{overall['win_rate']:.1%}")
+        c3.metric("Average odds", f"{overall['avg_odds']:.2f}")
+
+        st.caption(
+            "The app now looks for historical win rates in this order: Score+Odds bucket → Score bucket → Odds bucket → Overall ledger. "
+            "Tiny buckets are smoothed so one lucky winner does not distort the model."
+        )
+
+        st.markdown("### Score + Odds Calibration")
+        if combo_tbl.empty:
+            st.info("No score+odds calibration table yet.")
+        else:
+            st.dataframe(combo_tbl.sort_values(["Score_Band", "Odds_Band"]), use_container_width=True)
+
+        st.markdown("### Score Band Calibration")
+        if score_tbl.empty:
+            st.info("No score-band calibration table yet.")
+        else:
+            st.dataframe(score_tbl.sort_values("Score_Band"), use_container_width=True)
+
+        st.markdown("### Odds Band Calibration")
+        if odds_tbl.empty:
+            st.info("No odds-band calibration table yet.")
+        else:
+            st.dataframe(odds_tbl.sort_values("Odds_Band"), use_container_width=True)
+
+        st.warning(
+            "Calibration is only as good as the data in your ledger. Treat it as experimental until you have at least 100–300 settled bets."
+        )
+
+with tab5:
     st.subheader("🧪 Debug / API Fields")
     st.write("Use this to inspect exactly what your current API tier returns. This is important before adding more features.")
 
