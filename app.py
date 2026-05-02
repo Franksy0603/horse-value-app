@@ -53,12 +53,24 @@ LEDGER_COLUMNS = [
 st.sidebar.header("🛡️ Strategy Settings")
 race_filter = st.sidebar.selectbox("Race Type Filter", ["Handicaps Only", "All Race Types"], index=0)
 base_stake = st.sidebar.number_input("Base Stake (£)", min_value=1.0, value=5.0, step=1.0)
-min_score = st.sidebar.slider("Minimum Raw Score", 0, 80, 30, 5)
+min_score = st.sidebar.slider(
+    "Minimum Raw Score",
+    0,
+    80,
+    25,
+    5,
+    help="Start around 20–25 while the model is being calibrated. Increase only after you have enough settled results."
+) min_edge = st.sidebar.slider(
+    "Minimum Edge",
+    -0.50,
+    0.25,
+    -0.05,rated. Increase only after you have enough settled results."
+)
 min_edge = st.sidebar.slider(
     "Minimum Edge",
     -0.50,
     0.25,
-    0.00,
+    -0.05,
     0.01,
     help="0.00 means only horses with non-negative estimated edge qualify. Use a negative value when testing to see all runners that pass score/odds filters."
 )
@@ -67,12 +79,13 @@ max_odds = st.sidebar.number_input("Maximum Odds", min_value=1.01, value=40.0, s
 
 st.sidebar.divider()
 st.sidebar.subheader("📈 Market Filters")
-require_steam = st.sidebar.checkbox("Require shortening odds / positive market move", value=False)
-allow_longshots_without_steam = st.sidebar.checkbox("Allow 10.0+ longshots without steam", value=True)
-qualification_mode = st.sidebar.selectbox(
+require_steam = st.sidebar.checkbox("Require shortening odqualification_mode = st.sidebar.selectbox(
     "Qualification Mode",
     ["Testing: show anything passing odds", "Score + Edge", "Strict Semi-Pro"],
-    index=0,
+    index=1,e = st.sidebar.selectbox(
+    "Qualification Mode",
+    ["Testing: show anything passing odds", "Score + Edge", "Strict Semi-Pro"],
+    index=1,
     help="Use Testing mode first to confirm runners display. Then move to Score + Edge or Strict Semi-Pro once the data is flowing."
 )
 strict_strategy_rules = qualification_mode == "Strict Semi-Pro"
@@ -363,49 +376,77 @@ def get_advanced_score(runner: dict, race: dict) -> tuple[int, list[str], bool]:
             reasons.append("Quick Turnaround")
 
     # Weight / OR / age placeholders: safe if fields exist.
-    age = safe_num(runner.get("age"), np.nan)
-    if not pd.isna(age):
-        if age >= 10:
-            score -= 5
-            reasons.append("Older Horse")
+    age = safe_num(# Signal stacking: reward stronger combinations rather than treating every signal as isolated.
+    reason_set = set(reasons)
+    if "LTO Winner" in reason_set and "Class Drop" in reason_set:
+        score += 8
+        reasons.append("Power Combo: LTO + Class Drop")
+
+    if "Trainer Hot" in reason_set and ("Course & Distance" in reason_set or "Course Winner" in reason_set):
+        score += 6
+        reasons.append("Power Combo: Hot Trainer + Track Fit")
+
+    if "Good Recency" in reason_set and ("Recent Placed Form" in reason_set or "LTO Winner" in reason_set):
+        score += 5
+        reasons.append("Power Combo: Fit + In Form")
+
+    if "Long Layoff" in reason_set and "Trainer Cold" in reason_set:
+        score -= 8
+        reasons.append("Risk Combo: Layoff + Cold Trainer")
 
     # Keep score in sensible range
-    score = int(max(0, min(score, 80)))
+    score = int(max(0, min(score, 100)))
+    return score, reasons, is_elite   reasons.append("Older Horse")
+
+    # Signal stacking: reward stronger combinations rather than treating every signal as isolated.
+    reason_set = set(reasons)
+    if "LTO Winner" in reason_set and "Class Drop" in reason_set:
+        score += 8
+        reasons.append("Power Combo: LTO + Class Drop")
+
+    if "Trainer Hot" in reason_set and ("Course & Distance" in reason_set or "Course Winner" in reason_set):
+        score += 6
+        reasons.append("Power Combo: Hot Trainer + Track Fit")
+
+    if "Good Recency" in reason_set and ("Recent Placed Form" in reason_set or "LTO Winner" in reason_set):
+        score += 5
+        reasons.append("Power Combo: Fit + In Form")
+
+    if "Long Layoff" in reason_set and "Trainer Cold" in reason_set:
+        score -= 8
+        reasons.append("Risk Combo: Layoff + Cold Trainer")
+
+    # Keep score in sensible range
+    score = int(max(0, min(score, 100)))
     return score, reasons, is_elite
 
 
 def estimate_probability(score: float, odds: float, market_move=np.nan) -> float:
-    """Simple calibrated heuristic probability.
+    """Semi-pro heuristic probability estimate.
 
-    This is not a true trained model yet. It is deliberately conservative and anchored to the market,
-    because racing markets are strong. Your score can move the horse above or below market probability.
+    This is still not a trained model, but it is better calibrated for your current system:
+    - It anchors to market probability because markets are strong.
+    - Score 25 is treated as roughly neutral.
+    - Stronger scores are allowed to create real overlays.
+    - Probability caps are loosened so longshots are not killed automatically.
     """
     if odds <= 1:
         return 0.0
 
     market_prob = 1 / odds
 
-    # Score adjustment: score 30 is roughly neutral, higher scores increase estimated chance.
-    score_adjustment = (score - 30) * 0.004
+    # Stronger score impact than the earlier conservative version.
+    # Score 25 = neutral. Every 5 points above/below moves probability by about 4 percentage points.
+    score_adjustment = (score - 25) * 0.008
 
-    # Market steam adjustment: positive move implies shortening.
+    # Market steam adjustment: positive means odds have shortened.
     move_adjustment = 0
     if not pd.isna(market_move):
-        move_adjustment = np.clip(market_move * 0.01, -0.04, 0.04)
+        move_adjustment = np.clip(market_move * 0.0125, -0.06, 0.06)
 
     estimated = market_prob + score_adjustment + move_adjustment
 
-    # Conservative caps: avoid fantasy probabilities on longshots.
-    if odds >= 20:
-        estimated = min(estimated, 0.12)
-    elif odds >= 12:
-        estimated = min(estimated, 0.18)
-    elif odds >= 8:
-        estimated = min(estimated, 0.24)
-    else:
-        estimated = min(estimated, 0.35)
-
-    return round(float(max(0.01, estimated)), 4)
+    # Softer universal cap. This prevents impossible probabilities without suppressing lon
 
 
 def calculate_edge(estimated_prob: float, odds: float) -> tuple[float, float]:
