@@ -180,8 +180,44 @@ def load_ledger() -> pd.DataFrame:
 def update_ledger(df: pd.DataFrame):
     if not conn or not GSHEET_URL:
         st.error("Google Sheets connection is not configured.")
-        return
+        return False
     conn.update(spreadsheet=GSHEET_URL, data=df[LEDGER_COLUMNS])
+    return True
+
+
+def make_selection_key(df: pd.DataFrame) -> pd.Series:
+    """Stable key for avoiding duplicates and reconciling results."""
+    if df is None or df.empty:
+        return pd.Series(dtype=str)
+    return (
+        df["Date"].astype(str).str.strip() + "|" +
+        df["Horse"].astype(str).str.strip() + "|" +
+        df["Course"].astype(str).str.strip() + "|" +
+        df["Time"].astype(str).str.strip()
+    )
+
+
+def calculate_return_and_pl(result: str, odds_taken, stake, manual_return=None):
+    """Calculate return and P/L for simple win-style settlement.
+
+    For Each-Way / Place / 80-20 bets, use the manual return override for accuracy.
+    """
+    stake = safe_num(stake, 0)
+    odds_taken = safe_num(odds_taken, np.nan)
+
+    if manual_return not in [None, ""]:
+        ret = safe_num(manual_return, 0)
+        return round(ret, 2), round(ret - stake, 2)
+
+    result_clean = str(result or "").strip().lower()
+    if result_clean in ["win", "won", "winner"] and not pd.isna(odds_taken):
+        ret = stake * odds_taken
+    elif result_clean in ["void", "non-runner", "nr"]:
+        ret = stake
+    else:
+        ret = 0.0
+
+    return round(ret, 2), round(ret - stake, 2)
 
 # =========================================================
 # 5. HELPER FUNCTIONS
@@ -912,34 +948,44 @@ with tab1:
             ]
             st.dataframe(df_show[display_cols], use_container_width=True)
 
-            if st.button("📤 Log Qualifiers to Ledger", use_container_width=True):
-                ledger = load_ledger()
-                qualifiers = df_all[df_all["Qualifies"]].copy()
+            st.markdown("### 🧾 Ledger Actions")
+            log_col, view_col = st.columns([1, 1])
 
-                if qualifiers.empty:
-                    st.warning("No qualifying selections to log.")
-                else:
-                    rows = []
-                    for _, h in qualifiers.iterrows():
-                        rows.append({col: h.get(col, np.nan) for col in LEDGER_COLUMNS})
-                    new_df = pd.DataFrame(rows)
-                    new_df = normalise_columns(new_df)
+            with log_col:
+                if st.button("📤 Log Qualifiers to Ledger", use_container_width=True):
+                    ledger = load_ledger()
+                    qualifiers = df_all[df_all["Qualifies"]].copy()
 
-                    # Robust duplicate key: date + horse + course + time
-                    ledger_key = (
-                        ledger["Date"].astype(str) + "|" + ledger["Horse"].astype(str) + "|" +
-                        ledger["Course"].astype(str) + "|" + ledger["Time"].astype(str)
-                    ) if not ledger.empty else pd.Series(dtype=str)
-                    new_key = (
-                        new_df["Date"].astype(str) + "|" + new_df["Horse"].astype(str) + "|" +
-                        new_df["Course"].astype(str) + "|" + new_df["Time"].astype(str)
-                    )
+                    if qualifiers.empty:
+                        st.warning("No qualifying selections to log.")
+                    else:
+                        rows = []
+                        for _, h in qualifiers.iterrows():
+                            rows.append({col: h.get(col, np.nan) for col in LEDGER_COLUMNS})
+                        new_df = pd.DataFrame(rows)
+                        new_df = normalise_columns(new_df)
 
-                    to_add = new_df[~new_key.isin(set(ledger_key))]
-                    updated = pd.concat([ledger, to_add], ignore_index=True)
-                    update_ledger(updated)
-                    st.success(f"Logged {len(to_add)} new selections. Skipped {len(new_df) - len(to_add)} duplicates.")
-                    st.balloons()
+                        ledger_key = make_selection_key(ledger) if not ledger.empty else pd.Series(dtype=str)
+                        new_key = make_selection_key(new_df)
+
+                        to_add = new_df[~new_key.isin(set(ledger_key))]
+                        updated = pd.concat([ledger, to_add], ignore_index=True)
+                        if update_ledger(updated):
+                            st.success(f"Logged {len(to_add)} new selections. Skipped {len(new_df) - len(to_add)} duplicates.")
+                            st.balloons()
+
+            with view_col:
+                if st.button("📋 Show Today’s Pending Qualifiers", use_container_width=True):
+                    ledger = load_ledger()
+                    today = datetime.now().strftime("%Y-%m-%d")
+                    pending_today = ledger[
+                        (ledger["Date"].astype(str) == today) &
+                        (ledger["Result"].astype(str).str.lower().eq("pending"))
+                    ]
+                    if pending_today.empty:
+                        st.info("No pending qualifiers logged for today.")
+                    else:
+                        st.dataframe(pending_today[["Date", "Horse", "Course", "Time", "Odds_Taken", "Stake", "Bet_Type", "Score", "Edge"]], use_container_width=True)
 
         st.divider()
         st.subheader("🏁 Full Race Details")
@@ -960,8 +1006,96 @@ with tab1:
 with tab2:
     st.subheader("Performance Ledger")
     ledger = load_ledger()
+
+    st.markdown("### ✅ Reconcile Pending Qualifiers")
+    pending = ledger[ledger["Result"].astype(str).str.lower().eq("pending")].copy()
+
+    if pending.empty:
+        st.info("No pending qualifiers to reconcile.")
+    else:
+        pending["Selection_Label"] = (
+            pending["Date"].astype(str) + " — " +
+            pending["Time"].astype(str) + " " +
+            pending["Course"].astype(str) + " — " +
+            pending["Horse"].astype(str) + " @ " +
+            pending["Odds_Taken"].astype(str)
+        )
+
+        selected_label = st.selectbox(
+            "Choose a qualifier to reconcile",
+            pending["Selection_Label"].tolist(),
+            index=0,
+        )
+
+        selected_idx = pending[pending["Selection_Label"] == selected_label].index[0]
+        selected_row = ledger.loc[selected_idx]
+
+        r1, r2, r3, r4 = st.columns(4)
+        with r1:
+            result_input = st.selectbox("Result", ["Win", "Lose", "Placed", "Void", "Non-Runner"], index=1)
+        with r2:
+            position_input = st.number_input("Finishing Position", min_value=0, value=0, step=1)
+        with r3:
+            sp_input = st.number_input(
+                "SP / BSP",
+                min_value=0.0,
+                value=float(safe_num(selected_row.get("SP"), 0) or 0),
+                step=0.1,
+            )
+        with r4:
+            manual_return_input = st.number_input(
+                "Return (£)",
+                min_value=0.0,
+                value=0.0,
+                step=0.5,
+                help="Use this for Each-Way, Place, 80/20 or any settled return. For simple Win bets, leave 0 and the app can calculate automatically."
+            )
+
+        notes_input = st.text_area("Settlement Notes", value=str(selected_row.get("Notes", "") or ""), height=80)
+
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1:
+            if st.button("✅ Save Result", use_container_width=True):
+                manual_return = manual_return_input if manual_return_input > 0 else None
+                ret, pl = calculate_return_and_pl(
+                    result_input,
+                    selected_row.get("Odds_Taken"),
+                    selected_row.get("Stake"),
+                    manual_return=manual_return,
+                )
+
+                ledger.loc[selected_idx, "Result"] = result_input
+                ledger.loc[selected_idx, "Position"] = position_input
+                ledger.loc[selected_idx, "SP"] = sp_input if sp_input > 0 else selected_row.get("SP")
+                ledger.loc[selected_idx, "Return"] = ret
+                ledger.loc[selected_idx, "P/L"] = pl
+                ledger.loc[selected_idx, "Notes"] = notes_input
+
+                # Closing line value / market movement: positive means you beat SP/BSP.
+                odds_taken = safe_num(selected_row.get("Odds_Taken"), np.nan)
+                if sp_input > 1 and not pd.isna(odds_taken):
+                    ledger.loc[selected_idx, "Market_Move"] = round(odds_taken - sp_input, 2)
+                    ledger.loc[selected_idx, "Market_Move_Band"] = market_move_band(odds_taken - sp_input)
+
+                if update_ledger(ledger):
+                    st.success(f"Updated {selected_row.get('Horse')} — Return £{ret:.2f}, P/L £{pl:.2f}")
+                    st.rerun()
+
+        with c2:
+            if st.button("↩️ Mark as Pending", use_container_width=True):
+                ledger.loc[selected_idx, "Result"] = "Pending"
+                ledger.loc[selected_idx, "Position"] = np.nan
+                ledger.loc[selected_idx, "Return"] = 0.0
+                ledger.loc[selected_idx, "P/L"] = 0.0
+                if update_ledger(ledger):
+                    st.success("Selection reset to Pending.")
+                    st.rerun()
+
+        st.caption("Tip: for Each-Way, Place or 80/20 bets, type the bookmaker/exchange settled return into Return (£) for accurate P/L.")
+
+    st.divider()
+    st.markdown("### Full Ledger")
     st.dataframe(ledger, use_container_width=True)
-    st.caption("Update results, positions, returns and P/L in your Google Sheet, then refresh this tab.")
 
 with tab3:
     st.subheader("📈 Performance Dashboard")
