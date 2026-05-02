@@ -62,6 +62,11 @@ st.sidebar.divider()
 st.sidebar.subheader("📈 Market Filters")
 require_steam = st.sidebar.checkbox("Require shortening odds / positive market move", value=False)
 allow_longshots_without_steam = st.sidebar.checkbox("Allow 10.0+ longshots without steam", value=True)
+strict_strategy_rules = st.sidebar.checkbox(
+    "Use strict semi-pro strategy rules",
+    value=False,
+    help="When off, the sidebar score/edge/odds filters decide qualifiers. When on, selections must also match Core Value / Longshot strategy rules."
+)
 
 st.sidebar.divider()
 st.sidebar.subheader("💰 Staking")
@@ -401,20 +406,23 @@ def calculate_edge(estimated_prob: float, odds: float) -> tuple[float, float]:
 
 
 def assign_strategy(score, odds, edge, market_move) -> str:
+    """Label the runner type.
+
+    This function should describe the selection, not silently block it.
+    The actual yes/no decision happens in qualifies_selection().
+    """
     has_steam = not pd.isna(market_move) and market_move > 0
 
-    if odds >= 10 and score >= 30 and edge >= min_edge:
-        if has_steam:
-            return "Value Longshot + Steam"
-        return "Value Longshot"
+    if odds >= 10:
+        return "Value Longshot + Steam" if has_steam else "Value Longshot"
 
-    if 5 <= odds < 10 and score >= 30 and edge >= min_edge and has_steam:
-        return "Core Value"
+    if 5 <= odds < 10:
+        return "Core Value" if has_steam else "Core Value - No Steam"
 
-    if score >= 35 and edge >= min_edge:
-        return "Watchlist Value"
+    if odds < 5:
+        return "Short Price Watchlist"
 
-    return "No Bet"
+    return "Watchlist Value"
 
 
 def calculate_stake(base, odds, estimated_prob, edge):
@@ -437,8 +445,12 @@ def calculate_stake(base, odds, estimated_prob, edge):
 
 
 def qualifies_selection(strategy, odds, score, edge, market_move):
-    if strategy == "No Bet":
-        return False
+    """Final qualifier gate.
+
+    Important fix: the previous version hard-coded strategy requirements of score >= 30.
+    That meant the sidebar sliders could be set to 0 and still return no qualifiers.
+    This version respects your sidebar settings first, then optionally applies stricter strategy rules.
+    """
     if odds < min_odds or odds > max_odds:
         return False
     if score < min_score:
@@ -446,11 +458,21 @@ def qualifies_selection(strategy, odds, score, edge, market_move):
     if edge < min_edge:
         return False
 
+    has_steam = not pd.isna(market_move) and market_move > 0
+
     if require_steam:
-        has_steam = not pd.isna(market_move) and market_move > 0
         if has_steam:
             return True
         if allow_longshots_without_steam and odds >= 10:
+            return True
+        return False
+
+    if strict_strategy_rules:
+        if odds >= 10 and score >= 30:
+            return True
+        if 5 <= odds < 10 and score >= 30 and has_steam:
+            return True
+        if score >= 35 and edge >= min_edge:
             return True
         return False
 
