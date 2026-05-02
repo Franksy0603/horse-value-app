@@ -21,7 +21,7 @@ COURSE_INFO = {
     "Doncaster": "Left", "York": "Left", "Goodwood": "Right", "Haydock": "Left"
 }
 
-st.set_page_config(page_title="Value Finder Pro V5.6.1", layout="wide")
+st.set_page_config(page_title="Value Finder Pro V5.6.2", layout="wide")
 st.title("🏇 Value Finder Pro: Bankroll Shield")
 
 # --- 2. SIDEBAR ---
@@ -32,7 +32,7 @@ min_score = st.sidebar.slider("Min Value Score", 0, 60, 25, 5)
 
 st.sidebar.divider()
 st.sidebar.subheader("💎 Value Protection")
-min_place_return = st.sidebar.checkbox("🚀 Enable Bankroll Shield", value=True)
+min_place_return = st.sidebar.checkbox("🚀 Enable Bankroll Shield", value=True, help="Only shows horses where Place Odds >= 2.0")
 hide_low_value = st.sidebar.checkbox("🔍 Hide Non-Value Races", value=True)
 
 if 'value_horses' not in st.session_state: st.session_state.value_horses = []
@@ -51,7 +51,8 @@ def load_ledger():
             df.columns = [str(c).strip().title() for c in df.columns]
             return df
         except: pass
-    return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Stake", "Result", "Pos", "P/L", "Market_Move"])
+    # Default columns if sheet fails to load (Now 12 columns)
+    return pd.DataFrame(columns=["Date", "Horse", "Course", "Time", "Odds", "Score", "Place_Odds", "Stake", "Result", "Pos", "P/L", "Market_Move"])
 
 # --- 4. THE MASTER SCORING ENGINE ---
 def get_advanced_score(r_data, race_data):
@@ -139,8 +140,8 @@ with tab1:
                                 "Course": race.get('course'),
                                 "Time": race.get('off_time', 'N/A'),
                                 "Odds": odds, 
-                                "Place_Odds": round(p_odds, 2),
                                 "Score": score, 
+                                "Place_Odds": round(p_odds, 2),
                                 "Stake": stake_input,
                                 "Analysis": reasons, 
                                 "Elite": is_elite
@@ -149,10 +150,6 @@ with tab1:
 
     if st.session_state.value_horses:
         st.divider()
-        # Metrics
-        total_found = len(st.session_state.value_horses)
-        st.metric("Selections Found", total_found)
-
         st.subheader("🎯 High-Probability Selections")
         sorted_val = sorted(st.session_state.value_horses, key=lambda x: x['Score'], reverse=True)
         vcols = st.columns(min(len(sorted_val), 4))
@@ -164,10 +161,9 @@ with tab1:
                 <h2 style='margin:0;'>{h['Horse']}</h2><b>{h['Time']} - {h['Course']}</b><br>Score: {h['Score']} | Win: {h['Odds']} | Place: {h['Place_Odds']}
                 {"<br>⭐ <b>TRIPLE SIGNAL</b>" if is_triple else ""}</div>""", unsafe_allow_html=True)
         
-        # --- FIXED LOGGING SECTION ---
+        # --- UPDATED LOGGING SECTION (12 COLUMNS) ---
         if st.button("📤 LOG SELECTIONS"):
             ledger = load_ledger()
-            # We strictly only grab the 7 columns that match your Sheet's structure
             log_data = []
             for h in st.session_state.value_horses:
                 log_data.append({
@@ -177,15 +173,14 @@ with tab1:
                     "Time": h["Time"],
                     "Odds": h["Odds"],
                     "Score": h["Score"],
+                    "Place_Odds": h["Place_Odds"],
                     "Stake": h["Stake"]
                 })
             
             new_df = pd.DataFrame(log_data)
-            # Add the 4 pending columns (Result, Pos, P/L, Market_Move) to reach 11
             for col in ["Result", "Pos", "P/L", "Market_Move"]:
                 new_df[col] = "Pending" if col == "Result" else 0.0
             
-            # Combine and push
             updated_df = pd.concat([ledger, new_df[~new_df['Horse'].isin(ledger['Horse'])]], ignore_index=True)
             conn.update(spreadsheet=GSHEET_URL, data=updated_df)
             st.balloons()
@@ -194,6 +189,9 @@ with tab1:
         st.divider()
         st.header("🏁 Detailed Race Analysis")
         for race in st.session_state.all_races:
+            is_hcap = "Handicap" in str(race.get('race_name', ''))
+            if race_filter == "Handicaps Only" and not is_hcap: continue
+            
             runners = race.get('runners', [])
             with st.expander(f"🕒 {race.get('off_time')} - {race.get('course')}"):
                 for r in runners:
