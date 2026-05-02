@@ -54,7 +54,14 @@ st.sidebar.header("🛡️ Strategy Settings")
 race_filter = st.sidebar.selectbox("Race Type Filter", ["Handicaps Only", "All Race Types"], index=0)
 base_stake = st.sidebar.number_input("Base Stake (£)", min_value=1.0, value=5.0, step=1.0)
 min_score = st.sidebar.slider("Minimum Raw Score", 0, 80, 30, 5)
-min_edge = st.sidebar.slider("Minimum Edge", 0.00, 0.25, 0.05, 0.01)
+min_edge = st.sidebar.slider(
+    "Minimum Edge",
+    -0.50,
+    0.25,
+    0.00,
+    0.01,
+    help="0.00 means only horses with non-negative estimated edge qualify. Use a negative value when testing to see all runners that pass score/odds filters."
+)
 min_odds = st.sidebar.number_input("Minimum Odds", min_value=1.01, value=5.0, step=0.5)
 max_odds = st.sidebar.number_input("Maximum Odds", min_value=1.01, value=40.0, step=1.0)
 
@@ -78,6 +85,7 @@ st.sidebar.divider()
 st.sidebar.subheader("👀 Display")
 hide_non_qualifiers = st.sidebar.checkbox("Hide Non-Qualifiers", value=True)
 show_full_debug = st.sidebar.checkbox("Show Full Runner Debug", value=False)
+show_filter_diagnostics = st.sidebar.checkbox("Show filter diagnostics", value=True)
 
 # =========================================================
 # 3. SESSION STATE
@@ -515,6 +523,31 @@ def analyse_racecards(racecards):
             strategy = assign_strategy(score, odds, edge, market_move)
             stake = calculate_stake(base_stake, odds, estimated_prob, edge)
 
+            qualifies = qualifies_selection(strategy, odds, score, edge, market_move)
+
+            failed_filters = []
+            if odds < min_odds:
+                failed_filters.append("Below min odds")
+            if odds > max_odds:
+                failed_filters.append("Above max odds")
+            if score < min_score:
+                failed_filters.append("Below min score")
+            if edge < min_edge:
+                failed_filters.append("Below min edge")
+            if require_steam:
+                has_steam = not pd.isna(market_move) and market_move > 0
+                if not has_steam and not (allow_longshots_without_steam and odds >= 10):
+                    failed_filters.append("No steam")
+            if strict_strategy_rules:
+                has_steam = not pd.isna(market_move) and market_move > 0
+                strict_pass = (
+                    (odds >= 10 and score >= 30) or
+                    (5 <= odds < 10 and score >= 30 and has_steam) or
+                    (score >= 35 and edge >= min_edge)
+                )
+                if not strict_pass:
+                    failed_filters.append("Strict rules")
+
             selection = {
                 "Date": datetime.now().strftime("%Y-%m-%d"),
                 "Horse": runner.get("horse"),
@@ -543,8 +576,9 @@ def analyse_racecards(racecards):
                 "P/L": 0.0,
                 "Reason_Tags": " | ".join(reasons),
                 "Notes": f"Odds source: {odds_source}",
+                "Filter_Reason": "Pass" if qualifies else " | ".join(failed_filters),
                 "Elite": is_elite,
-                "Qualifies": qualifies_selection(strategy, odds, score, edge, market_move),
+                "Qualifies": qualifies,
             }
             selections.append(selection)
 
@@ -639,6 +673,19 @@ with tab1:
         m2.metric("Analysed Runners", total_count)
         m3.metric("Avg Qualifier Edge", f"{avg_edge:.2%}" if q_count else "0.00%")
 
+        if show_filter_diagnostics:
+            st.subheader("🧪 Filter Diagnostics")
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("Pass Odds", int(((df_all["Odds_Taken"] >= min_odds) & (df_all["Odds_Taken"] <= max_odds)).sum()))
+            d2.metric("Pass Score", int((df_all["Score"] >= min_score).sum()))
+            d3.metric("Pass Edge", int((df_all["Edge"] >= min_edge).sum()))
+            d4.metric("Qualifiers", int(df_all["Qualifies"].sum()))
+            if "Filter_Reason" in df_all.columns:
+                st.dataframe(
+                    df_all["Filter_Reason"].value_counts().reset_index().rename(columns={"index": "Filter Reason", "Filter_Reason": "Count"}),
+                    use_container_width=True
+                )
+
         st.subheader("🎯 Qualified Selections")
         if df_show.empty:
             st.info("No qualifiers match the current settings.")
@@ -670,7 +717,7 @@ with tab1:
             st.subheader("Selection Table")
             display_cols = [
                 "Qualifies", "Horse", "Course", "Time", "Strategy", "Odds_Taken", "Opening_Odds",
-                "Market_Move", "Score", "Implied_Prob", "Estimated_Prob", "Edge", "EV", "Stake", "Reason_Tags"
+                "Market_Move", "Score", "Implied_Prob", "Estimated_Prob", "Edge", "EV", "Stake", "Filter_Reason", "Reason_Tags"
             ]
             st.dataframe(df_show[display_cols], use_container_width=True)
 
