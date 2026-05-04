@@ -713,34 +713,63 @@ def fetch_racecards():
 
 
 def fetch_results_for_date(target_date: str):
-    """Fetch racing results for a date using likely Racing API endpoint patterns.
+    """Fetch racing results for a date from The Racing API.
 
-    The API has changed endpoint naming across examples/plans, so this tries several safe options.
-    The first successful JSON response containing race/result data is returned.
+    The /v1/results endpoint expects start_date, end_date, limit and skip.
+    It returns paginated results, so this function fetches all available pages for the selected date.
     """
     auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
-    candidate_requests = [
-        (f"{BASE_URL}/results", {"date": target_date}),
-        (f"{BASE_URL}/results/{target_date}", None),
-        (f"{BASE_URL}/racecards/results", {"date": target_date}),
-        (f"{BASE_URL}/racecards/standard", {"date": target_date}),
-    ]
-
+    url = f"{BASE_URL}/results"
+    limit = 50
+    skip = 0
+    all_results = []
     errors = []
-    for url, params in candidate_requests:
+
+    while True:
+        params = {
+            "start_date": target_date,
+            "end_date": target_date,
+            "limit": limit,
+            "skip": skip,
+        }
+
         try:
             response = requests.get(url, auth=auth, params=params, timeout=30)
-            if response.status_code == 404:
-                errors.append(f"404: {url}")
-                continue
+            response.raise_for_status()
+            data = response.json()
+
+            races = extract_result_races(data)
+            if races:
+                all_results.extend(races)
+
+            total = safe_num(data.get("total", 0), 0) if isinstance(data, dict) else len(all_results)
+            skip += limit
+
+            if skip >= total or not races:
+                break
+
+        except Exception as e:
+            errors.append(str(e))
+            break
+
+    if all_results:
+        return all_results, f"{url}?start_date={target_date}&end_date={target_date}"
+
+    # Fallback for accounts/plans where results may also be embedded in standard racecards.
+    fallback_requests = [
+        (f"{BASE_URL}/racecards/standard", {"start_date": target_date, "end_date": target_date, "limit": limit, "skip": 0}),
+    ]
+
+    for fb_url, params in fallback_requests:
+        try:
+            response = requests.get(fb_url, auth=auth, params=params, timeout=30)
             response.raise_for_status()
             data = response.json()
             races = extract_result_races(data)
             if races:
-                return races, f"{url}"
-            errors.append(f"No races found: {url}")
+                return races, f"{fb_url}?start_date={target_date}&end_date={target_date}"
         except Exception as e:
-            errors.append(f"{url}: {e}")
+            errors.append(f"{fb_url}: {e}")
 
     return [], " | ".join(errors)
 
