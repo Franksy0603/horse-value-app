@@ -712,6 +712,219 @@ def fetch_racecards():
     return data.get("racecards", [])
 
 
+def fetch_results_for_date(target_date: str):
+    """Fetch racing results for a date using likely Racing API endpoint patterns.
+
+    The API has changed endpoint naming across examples/plans, so this tries several safe options.
+    The first successful JSON response containing race/result data is returned.
+    """
+    auth = HTTPBasicAuth(API_USER.strip(), API_PASS.strip())
+    candidate_requests = [
+        (f"{BASE_URL}/results", {"date": target_date}),
+        (f"{BASE_URL}/results/{target_date}", None),
+        (f"{BASE_URL}/racecards/results", {"date": target_date}),
+        (f"{BASE_URL}/racecards/standard", {"date": target_date}),
+    ]
+
+    errors = []
+    for url, params in candidate_requests:
+        try:
+            response = requests.get(url, auth=auth, params=params, timeout=30)
+            if response.status_code == 404:
+                errors.append(f"404: {url}")
+                continue
+            response.raise_for_status()
+            data = response.json()
+            races = extract_result_races(data)
+            if races:
+                return races, f"{url}"
+            errors.append(f"No races found: {url}")
+        except Exception as e:
+            errors.append(f"{url}: {e}")
+
+    return [], " | ".join(errors)
+
+
+def normalise_name(value):
+    txt = str(value or "").lower().strip()
+    keep = []
+    for ch in txt:
+        if ch.isalnum() or ch.isspace():
+            keep.append(ch)
+    return " ".join("".join(keep).split())
+
+
+def normalise_time(value):
+    txt = str(value or "").strip()
+    if not txt:
+        return ""
+    # Handles '14:30', '2:30', '14:30:00'
+    try:
+        return pd.to_datetime(txt).strftime("%H:%M")
+    except Exception:
+        return txt[:5]
+
+
+def extract_result_races(data):
+    """Return a list of race dictionaries from common API response shapes."""
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+
+    for key in ["results", "racecards", "races", "data"]:
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = extract_result_races(value)
+            if nested:
+                return nested
+    return []
+
+
+def extract_result_runners(race):
+    for key in ["runners", "results", "finishers", "horses"]:
+        value = race.get(key) if isinstance(race, dict) else None
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def extract_position(runner):
+    for key in ["position", "pos", "finish_position", "finishing_position", "result"]:
+        val = runner.get(key) if isinstance(runner, dict) else None
+        if val not in [None, ""]:
+            txt = str(val).strip().lower()
+            if txt in ["nr", "non-runner", "non runner"]:
+                return "NR"
+            digits = "".join(ch for ch in txt if ch.isdigit())
+            if digits:
+                return int(digits)
+    return np.nan
+
+
+def extract_runner_sp_from_result(runner):
+    for key in ["sp_dec", "sp", "bsp", "starting_price", "starting_price_dec"]:
+        val = safe_num(runner.get(key), np.nan) if isinstance(runner, dict) else np.nan
+        if not pd.isna(val) and val > 1:
+            return float(val)
+    return np.nan
+
+
+def race_matches_ledger_row(race, row):
+    race_course = normalise_name(race.get("course") or race.get("track") or race.get("course_name"))
+    row_course = normalise_name(row.get("Course"))
+    if race_course and row_course and race_course != row_course:
+        return False
+
+    race_time = normalise_time(race.get("off_time") or race.get("time") or race.get("race_time"))
+    row_time = normalise_time(row.get("Time"))
+    if race_time and row_time and race_time != row_time:
+        return False
+
+    return True
+
+
+def find_result_for_ledger_row(row, result_races):
+    target_horse = normalise_name(row.get("Horse"))
+    if not target_horse:
+        return None, "Missing horse name"
+
+    possible_races = [race for race in result_races if isinstance(race, dict) and race_matches_ledger_row(race, row)]
+    if not possible_races:
+        return None, "No matching race"
+
+    for race in possible_races:
+        runners = extract_result_runners(race)
+        for runner in runners:
+            horse_name = normalise_name(runner.get("horse") or runner.get("horse_name") or runner.get("name"))
+            if horse_name == target_horse:
+                return {"race": race, "runner": runner}, "Matched"
+
+    # Fuzzy-ish fallback: exact words contained either way.
+    for race in possible_races:
+        runners = extract_result_runners(race)
+        for runner in runners:
+            horse_name = normalise_name(runner.get("horse") or runner.get("horse_name") or runner.get("name"))
+            if horse_name and (horse_name in target_horse or target_horse in horse_name):
+                return {"race": race, "runner": runner}, "Fuzzy matched"
+
+    return None, "Race found, horse not matched"
+
+
+def result_label_from_position(position):
+    if str(position).upper() == "NR":
+        return "Non-Runner"
+    pos = safe_num(position, np.nan)
+    if pd.isna(pos):
+        return "Pending"
+    if int(pos) == 1:
+        return "Win"
+    return "Lose"
+
+
+def auto_reconcile_pending_results(target_date: str):
+    ledger = load_ledger()
+    if ledger.empty:
+        return ledger, pd.DataFrame(), "Ledger is empty"
+
+    pending_mask = (
+        ledger["Result"].astype(str).str.lower().eq("pending") &
+        ledger["Date"].astype(str).eq(target_date)
+    )
+    pending = ledger[pending_mask].copy()
+    if pending.empty:
+        return ledger, pd.DataFrame(), "No pending selections for this date"
+
+    result_races, source = fetch_results_for_date(target_date)
+    if not result_races:
+        return ledger, pd.DataFrame(), f"No results returned. Tried: {source}"
+
+    audit_rows = []
+    for idx, row in pending.iterrows():
+        match, status = find_result_for_ledger_row(row, result_races)
+        if not match:
+            audit_rows.append({
+                "Horse": row.get("Horse"), "Course": row.get("Course"), "Time": row.get("Time"),
+                "Status": status, "Updated": False
+            })
+            continue
+
+        runner = match["runner"]
+        position = extract_position(runner)
+        result_label = result_label_from_position(position)
+        sp = extract_runner_sp_from_result(runner)
+
+        manual_return = None
+        ret, pl = calculate_return_and_pl(
+            result_label,
+            row.get("Odds_Taken"),
+            row.get("Stake"),
+            manual_return=manual_return,
+        )
+
+        ledger.loc[idx, "Result"] = result_label
+        ledger.loc[idx, "Position"] = position
+        if not pd.isna(sp):
+            ledger.loc[idx, "SP"] = sp
+            odds_taken = safe_num(row.get("Odds_Taken"), np.nan)
+            if not pd.isna(odds_taken):
+                ledger.loc[idx, "Market_Move"] = round(odds_taken - sp, 2)
+                ledger.loc[idx, "Market_Move_Band"] = market_move_band(odds_taken - sp)
+        ledger.loc[idx, "Return"] = ret
+        ledger.loc[idx, "P/L"] = pl
+        ledger.loc[idx, "Notes"] = f"{row.get('Notes', '')}; Auto-reconciled from {source} ({status})"
+
+        audit_rows.append({
+            "Horse": row.get("Horse"), "Course": row.get("Course"), "Time": row.get("Time"),
+            "Status": status, "Result": result_label, "Position": position, "SP": sp,
+            "Return": ret, "P/L": pl, "Updated": True
+        })
+
+    return ledger, pd.DataFrame(audit_rows), source
+
+
 def analyse_racecards(racecards):
     selections = []
 
@@ -1007,7 +1220,31 @@ with tab2:
     st.subheader("Performance Ledger")
     ledger = load_ledger()
 
-    st.markdown("### ✅ Reconcile Pending Qualifiers")
+    st.markdown("### 🔄 Auto-Reconcile Results")
+    ar1, ar2, ar3 = st.columns([1, 1, 2])
+    with ar1:
+        reconcile_date = st.date_input("Results date", value=date.today())
+    with ar2:
+        st.write("")
+        st.write("")
+        auto_button = st.button("🔄 Auto-Reconcile Pending Results", use_container_width=True)
+
+    if auto_button:
+        target_date = reconcile_date.strftime("%Y-%m-%d")
+        with st.spinner(f"Fetching official results and reconciling pending selections for {target_date}..."):
+            updated_ledger, audit_df, source_msg = auto_reconcile_pending_results(target_date)
+            if audit_df.empty:
+                st.warning(source_msg)
+            else:
+                if update_ledger(updated_ledger):
+                    updated_count = int(audit_df["Updated"].sum()) if "Updated" in audit_df.columns else 0
+                    st.success(f"Auto-reconciled {updated_count} selections. Source: {source_msg}")
+                    st.dataframe(audit_df, use_container_width=True)
+                    if updated_count > 0:
+                        st.rerun()
+
+    st.divider()
+    st.markdown("### ✅ Manual Reconcile Pending Qualifiers")
     pending = ledger[ledger["Result"].astype(str).str.lower().eq("pending")].copy()
 
     if pending.empty:
