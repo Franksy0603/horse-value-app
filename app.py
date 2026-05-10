@@ -66,8 +66,8 @@ min_score = st.sidebar.slider(
 value_filter_mode = st.sidebar.selectbox(
     "Value Filter Mode",
     ["EV", "Edge", "EV or Edge", "EV and Edge"],
-    index=0,
-    help="EV is usually less sensitive than raw edge. Edge is probability difference. EV is expected return per £1 staked."
+    index=2,
+    help="Use EV or Edge while calibrating. EV and Edge is deliberately very strict and can easily return no qualifiers."
 )
 
 min_edge = st.sidebar.slider(
@@ -1202,7 +1202,9 @@ with tab1:
                     d3.metric("Pass EV/Edge", int(((df_all["EV"] >= min_ev) | (df_all["Edge"] >= min_edge)).sum()))
                 else:
                     d3.metric("Pass EV+Edge", int(((df_all["EV"] >= min_ev) & (df_all["Edge"] >= min_edge)).sum()))
-            d4.metric("Qualifiers", int(df_all["Qualifies"].sum()))
+            score_value_pass = int(((df_all["Score"] >= min_score) & df_all.apply(lambda r: passes_value_filter(r["Edge"], r["EV"]), axis=1)).sum()) if qualification_mode != "Testing: show anything passing odds" else "Bypassed"
+            d4.metric("Score + Value", score_value_pass)
+            st.metric("Final Qualifiers", int(df_all["Qualifies"].sum()))
             st.caption(
                 f"Score range: {int(df_all['Score'].min())}–{int(df_all['Score'].max())} | "
                 f"Median score: {df_all['Score'].median():.1f} | "
