@@ -1063,11 +1063,13 @@ def analyse_racecards(racecards):
                 if not has_steam and not (allow_longshots_without_steam and odds >= 10):
                     failed_filters.append("No steam")
             if qualification_mode == "Strict Semi-Pro":
-        if mode_profile == "Higher Hit Rate":
-            if odds < 3 or odds > 12:
-                return False
-            if score < 20:
-                return False
+                # Apply Higher Hit Rate profile inside strict diagnostics (do not return here)
+                if mode_profile == "Higher Hit Rate":
+                    if odds < 3 or odds > 12:
+                        failed_filters.append("Outside 3–12 odds (Hit Rate)")
+                    if score < 20:
+                        failed_filters.append("Score < 20 (Hit Rate)")
+
                 has_steam = not pd.isna(market_move) and market_move > 0
                 strict_pass = (
                     (odds >= 10 and score >= 25) or
