@@ -53,6 +53,13 @@ LEDGER_COLUMNS = [
 # =========================================================
 
 st.sidebar.header("🛡️ Strategy Settings")
+mode_profile = st.sidebar.selectbox(
+    "Strategy Profile",
+    ["Balanced (default)", "Higher Hit Rate"],
+    index=0,
+    help="Higher Hit Rate mode focuses on shorter-priced, more reliable horses."
+)
+
 race_filter = st.sidebar.selectbox("Race Type Filter", ["Handicaps Only", "All Race Types"], index=0)
 base_stake = st.sidebar.number_input("Base Stake (£)", min_value=1.0, value=5.0, step=1.0)
 min_score = st.sidebar.slider(
@@ -737,6 +744,12 @@ def qualifies_selection(strategy, odds, score, edge, market_move, ev=0):
         return False
 
     if qualification_mode == "Score + Edge":
+        # Apply profile adjustments
+        if mode_profile == "Higher Hit Rate":
+            if odds < 3 or odds > 12:
+                return False
+            if score < max(min_score, 20):
+                return False
         return True
 
     # Strict Semi-Pro
@@ -1050,6 +1063,11 @@ def analyse_racecards(racecards):
                 if not has_steam and not (allow_longshots_without_steam and odds >= 10):
                     failed_filters.append("No steam")
             if qualification_mode == "Strict Semi-Pro":
+        if mode_profile == "Higher Hit Rate":
+            if odds < 3 or odds > 12:
+                return False
+            if score < 20:
+                return False
                 has_steam = not pd.isna(market_move) and market_move > 0
                 strict_pass = (
                     (odds >= 10 and score >= 25) or
