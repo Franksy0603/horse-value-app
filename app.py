@@ -43,6 +43,8 @@ LEDGER_COLUMNS = [
     "Odds_Taken", "SP", "Score", "Score_Band", "Odds_Band",
     "Implied_Prob", "Estimated_Prob", "Edge", "EV",
     "Market_Move", "Market_Move_Band", "Stake", "Bet_Type",
+    "Field_Size", "Going", "Distance", "Draw", "OR", "Weight_Lbs",
+    "Odds_Source", "Best_Odds", "Avg_Odds", "Odds_Spread",
     "Result", "Position", "Return", "P/L", "Reason_Tags", "Notes"
 ]
 
@@ -61,13 +63,29 @@ min_score = st.sidebar.slider(
     5,
     help="Start around 20–25 while the model is being calibrated. Increase only after you have enough settled results."
 )
+value_filter_mode = st.sidebar.selectbox(
+    "Value Filter Mode",
+    ["EV", "Edge", "EV or Edge", "EV and Edge"],
+    index=0,
+    help="EV is usually less sensitive than raw edge. Edge is probability difference. EV is expected return per £1 staked."
+)
+
 min_edge = st.sidebar.slider(
     "Minimum Edge",
+    -0.20,
+    0.15,
+    0.00,
+    0.005,
+    help="Edge is estimated probability minus market probability. 0.05 means a very large 5 percentage-point edge."
+)
+
+min_ev = st.sidebar.slider(
+    "Minimum EV",
     -0.50,
-    0.25,
-    -0.05,
+    1.00,
+    0.00,
     0.01,
-    help="0.00 means only horses with non-negative estimated edge qualify. Use a negative value when testing or calibrating the model."
+    help="EV is expected profit per £1 staked. 0.00 is breakeven, 0.10 means +10p expected profit per £1."
 )
 min_odds = st.sidebar.number_input("Minimum Odds", min_value=1.01, value=5.0, step=0.5)
 max_odds = st.sidebar.number_input("Maximum Odds", min_value=1.01, value=40.0, step=1.0)
@@ -238,31 +256,46 @@ def text_contains(value, needle: str) -> bool:
     return needle.lower() in str(value or "").lower()
 
 
-def extract_odds(runner: dict) -> tuple[float, str]:
-    """Return best currently available decimal odds and source label.
+def extract_market_odds_features(runner: dict):
+    """Extract richer market data from all bookmaker odds when available.
 
-    Important: avoid relying on SP as the main betting price when possible.
-    SP is excellent for evaluation, but usually not the price you can select ahead of the race.
+    Returns best odds, average odds, spread and source. The previous app only used the first odds item,
+    which can miss better available prices and bookmaker disagreement.
     """
-    # Prefer live odds array if present
-    try:
-        odds_list = runner.get("odds") or []
-        if isinstance(odds_list, list) and odds_list:
-            for item in odds_list:
-                dec = safe_num(item.get("decimal"), np.nan)
-                if not pd.isna(dec) and dec > 1:
-                    bookmaker = item.get("bookmaker") or item.get("bookmaker_name") or "live_odds"
-                    return float(dec), str(bookmaker)
-    except Exception:
-        pass
+    odds_values = []
+    sources = []
 
-    # Fallbacks
+    odds_list = runner.get("odds") or []
+    if isinstance(odds_list, list):
+        for item in odds_list:
+            if not isinstance(item, dict):
+                continue
+            dec = safe_num(item.get("decimal"), np.nan)
+            if not pd.isna(dec) and dec > 1:
+                odds_values.append(float(dec))
+                sources.append(str(item.get("bookmaker") or item.get("bookmaker_name") or "bookmaker"))
+
+    if odds_values:
+        best = max(odds_values)
+        avg = float(np.mean(odds_values))
+        spread = best - min(odds_values)
+        try:
+            source = sources[odds_values.index(best)]
+        except Exception:
+            source = "best_bookmaker"
+        return round(best, 2), round(avg, 2), round(spread, 2), source
+
     for key in ["price", "decimal", "odds_dec", "forecast_dec", "sp_dec"]:
         dec = safe_num(runner.get(key), np.nan)
         if not pd.isna(dec) and dec > 1:
-            return float(dec), key
+            return float(dec), float(dec), 0.0, key
 
-    return 1.0, "missing"
+    return 1.0, 1.0, 0.0, "missing"
+
+
+def extract_odds(runner: dict) -> tuple[float, str]:
+    best, avg, spread, source = extract_market_odds_features(runner)
+    return best, source
 
 
 def extract_sp(runner: dict):
@@ -664,10 +697,25 @@ def calculate_stake(base, odds, estimated_prob, edge):
     return round(base * multiplier, 2)
 
 
-def qualifies_selection(strategy, odds, score, edge, market_move):
+def passes_value_filter(edge, ev):
+    edge_ok = (not pd.isna(edge)) and edge >= min_edge
+    ev_ok = (not pd.isna(ev)) and ev >= min_ev
+
+    if value_filter_mode == "EV":
+        return ev_ok
+    if value_filter_mode == "Edge":
+        return edge_ok
+    if value_filter_mode == "EV or Edge":
+        return ev_ok or edge_ok
+    if value_filter_mode == "EV and Edge":
+        return ev_ok and edge_ok
+    return ev_ok
+
+
+def qualifies_selection(strategy, odds, score, edge, market_move, ev=0):
     """Final qualifier gate.
 
-    Testing mode deliberately ignores score and edge so you can confirm that API runners
+    Testing mode deliberately ignores score and value filters so you can confirm that API runners
     and odds are being displayed before tightening the model filters.
     """
     if odds < min_odds or odds > max_odds:
@@ -684,7 +732,8 @@ def qualifies_selection(strategy, odds, score, edge, market_move):
 
     if score < min_score:
         return False
-    if pd.isna(edge) or edge < min_edge:
+
+    if not passes_value_filter(edge, ev):
         return False
 
     if qualification_mode == "Score + Edge":
@@ -695,7 +744,7 @@ def qualifies_selection(strategy, odds, score, edge, market_move):
         return True
     if 5 <= odds < 10 and score >= 25 and has_steam:
         return True
-    if score >= 30 and edge >= min_edge:
+    if score >= 30 and passes_value_filter(edge, ev):
         return True
     return False
 
@@ -984,7 +1033,7 @@ def analyse_racecards(racecards):
             strategy = assign_strategy(score, odds, edge, market_move)
             stake = calculate_stake(base_stake, odds, estimated_prob, edge)
 
-            qualifies = qualifies_selection(strategy, odds, score, edge, market_move)
+            qualifies = qualifies_selection(strategy, odds, score, edge, market_move, ev)
 
             failed_filters = []
             if odds < min_odds:
@@ -994,8 +1043,8 @@ def analyse_racecards(racecards):
             if qualification_mode != "Testing: show anything passing odds":
                 if score < min_score:
                     failed_filters.append("Below min score")
-                if pd.isna(edge) or edge < min_edge:
-                    failed_filters.append("Below min edge")
+                if not passes_value_filter(edge, ev):
+                    failed_filters.append(f"Below value filter ({value_filter_mode})")
             if require_steam:
                 has_steam = not pd.isna(market_move) and market_move > 0
                 if not has_steam and not (allow_longshots_without_steam and odds >= 10):
@@ -1142,7 +1191,17 @@ with tab1:
             d1, d2, d3, d4 = st.columns(4)
             d1.metric("Pass Odds", int(((df_all["Odds_Taken"] >= min_odds) & (df_all["Odds_Taken"] <= max_odds)).sum()))
             d2.metric("Pass Score", int((df_all["Score"] >= min_score).sum()))
-            d3.metric("Pass Edge", int((df_all["Edge"] >= min_edge).sum()) if qualification_mode != "Testing: show anything passing odds" else "Bypassed")
+            if qualification_mode == "Testing: show anything passing odds":
+                d3.metric("Pass Value", "Bypassed")
+            else:
+                if value_filter_mode == "EV":
+                    d3.metric("Pass EV", int((df_all["EV"] >= min_ev).sum()))
+                elif value_filter_mode == "Edge":
+                    d3.metric("Pass Edge", int((df_all["Edge"] >= min_edge).sum()))
+                elif value_filter_mode == "EV or Edge":
+                    d3.metric("Pass EV/Edge", int(((df_all["EV"] >= min_ev) | (df_all["Edge"] >= min_edge)).sum()))
+                else:
+                    d3.metric("Pass EV+Edge", int(((df_all["EV"] >= min_ev) & (df_all["Edge"] >= min_edge)).sum()))
             d4.metric("Qualifiers", int(df_all["Qualifies"].sum()))
             st.caption(
                 f"Score range: {int(df_all['Score'].min())}–{int(df_all['Score'].max())} | "
